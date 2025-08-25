@@ -1,0 +1,29 @@
+[package]
+name = "pinocchio-stake"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pinocchio = "0.9.0"
+pinocchio-log = "0.5.0"
+pinocchio-pubkey = "0.3.0"
+pinocchio-system = "0.3.0"
+shank = "0.4.2"
+pinocchio-token = "0.4.0"
+
+
+[dev-dependencies]
+solana-sdk = "2.2.1"
+mollusk-svm = "0.4.0"
+mollusk-svm-bencher = "0.4.0"
+
+[features]
+no-entrypoint = []
+test-default = ["no-entrypoint"]
+default = []
+bench-default = ["no-entrypoint"]
+
+
