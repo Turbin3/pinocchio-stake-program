@@ -78,6 +78,9 @@ Helpful flags:
 RUST_LOG=solana_runtime::message_processor=debug cargo test --features e2e -- --nocapture
 RUST_BACKTRACE=1 cargo test --features e2e -- --nocapture
 ```
+## Run Benchmarks
+
+cargo test --test bench --features e2e -- --ignored --nocapture
 
 ## Development Notes
 
