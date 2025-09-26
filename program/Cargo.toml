@@ -45,6 +45,7 @@ std = []
 default = ["std", "no-entrypoint"]
 e2e = []
 seed = []
+cu-trace = []
 
 [profile.dev]
 panic = "abort"
