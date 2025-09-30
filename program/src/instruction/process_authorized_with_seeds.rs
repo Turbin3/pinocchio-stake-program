@@ -50,7 +50,7 @@ pub fn process_authorized_with_seeds(
     // Build the signer set (include all tx signers). Base signer is sufficient
     // to satisfy policy for non-checked variant (old authority may change it).
     let mut signers_buf = [Pubkey::default(); MAXIMUM_SIGNERS];
-    let mut n = collect_signers(accounts, &mut signers_buf)?;
+    let n = collect_signers(accounts, &mut signers_buf)?;
     // No extra augmentation needed
 
     // Final signer slice we pass to the policy

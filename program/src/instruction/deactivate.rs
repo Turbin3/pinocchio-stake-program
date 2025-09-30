@@ -33,7 +33,7 @@ pub fn process_deactivate(accounts: &[AccountInfo]) -> ProgramResult {
 
     // 4) Authorization + state transition
     match state {
-        StakeStateV2::Stake(mut meta, mut stake, flags) => {
+        StakeStateV2::Stake(meta, mut stake, flags) => {
             // Require staker signature
             meta.authorized
                 .check(signers, StakeAuthorize::Staker)

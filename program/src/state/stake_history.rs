@@ -95,8 +95,37 @@ impl StakeHistory {
         }
     }
     #[inline]
-    pub fn from_account_data(_data: &[u8], _current_epoch: u64) -> Self {
-        Self::new()
+    pub fn from_account_data(data: &[u8], _current_epoch: u64) -> Self {
+        // Native layout: bincode Vec<(u64, StakeHistoryEntry)>
+        // [0..8) => len (u64, LE)
+        // then len elements of 32 bytes each: epoch (u64 LE), then 3x u64 LE
+        let mut sh = Self::new();
+        if data.len() < core::mem::size_of::<u64>() {
+            return sh;
+        }
+        let mut len_bytes = [0u8; 8];
+        len_bytes.copy_from_slice(&data[..8]);
+        let len = u64::from_le_bytes(len_bytes) as usize;
+        let want = len.saturating_mul(EPOCH_AND_ENTRY_SERIALIZED_SIZE as usize)
+            .saturating_add(core::mem::size_of::<u64>());
+        if data.len() < want { return sh; }
+
+        let mut off = 8usize; // skip len
+        let take = core::cmp::min(len, MAX_STAKE_HISTORY_ENTRIES);
+        for _ in 0..take {
+            let epoch = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
+            let effective = u64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap());
+            let activating = u64::from_le_bytes(data[off + 16..off + 24].try_into().unwrap());
+            let deactivating = u64::from_le_bytes(data[off + 24..off + 32].try_into().unwrap());
+            let _ = epoch; // epoch not stored in this fixed array representation
+            let _ = sh.push(StakeHistoryEntry {
+                effective: effective.to_le_bytes(),
+                activating: activating.to_le_bytes(),
+                deactivating: deactivating.to_le_bytes(),
+            });
+            off += EPOCH_AND_ENTRY_SERIALIZED_SIZE as usize;
+        }
+        sh
     }
     pub fn push(&mut self, entry: StakeHistoryEntry) -> Result<(), &'static str> {
         if self.len >= MAX_STAKE_HISTORY_ENTRIES {
@@ -121,47 +150,49 @@ impl StakeHistoryGetEntry for StakeHistorySysvar {
     fn get_entry(&self, target_epoch: Epoch) -> Option<StakeHistoryEntry> {
         let current_epoch = self.0;
 
-        // if current epoch is zero this returns None because there is no history yet
+        // Cannot query current or future epoch
         let newest_historical_epoch = current_epoch.checked_sub(1)?;
-        let oldest_historical_epoch =
-            current_epoch.saturating_sub(MAX_STAKE_HISTORY_ENTRIES as u64);
+        if target_epoch > newest_historical_epoch { return None; }
 
-        // target epoch is old enough to have fallen off history; presume fully active/deactive
-        if target_epoch < oldest_historical_epoch {
+        // Read vector length
+        let mut len_buf = [0u8; 8];
+        if get_sysvar(&mut len_buf, &ID, 0, 8).is_err() { return None; }
+        let len = u64::from_le_bytes(len_buf);
+        if len == 0 { return None; }
+
+        // Oldest epoch present in the sysvar buffer
+        // Oldest = current_epoch - len (saturating)
+        let oldest_historical_epoch = current_epoch.saturating_sub(len);
+        if target_epoch < oldest_historical_epoch { return None; }
+
+        // Index of target within the vector (0-based from start of entries)
+        // newest index = len-1 corresponds to epoch = current_epoch-1
+        // idx = (target_epoch - oldest_historical_epoch)
+        let distance_from_oldest = target_epoch.checked_sub(oldest_historical_epoch)?;
+        if distance_from_oldest >= len { return None; }
+        let idx = distance_from_oldest;
+
+        // Compute byte offset: skip len (8) + idx * entry_size
+        let offset = 8u64
+            .checked_add(idx.checked_mul(EPOCH_AND_ENTRY_SERIALIZED_SIZE)?)?;
+
+        let mut entry_buf = [0u8; EPOCH_AND_ENTRY_SERIALIZED_SIZE as usize];
+        if get_sysvar(&mut entry_buf, &ID, offset, EPOCH_AND_ENTRY_SERIALIZED_SIZE).is_err() {
             return None;
         }
 
-        // epoch delta is how many epoch-entries we offset in the stake history vector, which may be zero
-        // None means target epoch is current or in the future; this is a user error
-        let epoch_delta = newest_historical_epoch.checked_sub(target_epoch)?;
+        let entry_epoch = u64::from_le_bytes(entry_buf[0..8].try_into().unwrap());
+        let effective = u64::from_le_bytes(entry_buf[8..16].try_into().unwrap());
+        let activating = u64::from_le_bytes(entry_buf[16..24].try_into().unwrap());
+        let deactivating = u64::from_le_bytes(entry_buf[24..32].try_into().unwrap());
 
-        // offset is the number of bytes to our desired entry, including eight for vector length
-        let offset = epoch_delta
-            .checked_mul(EPOCH_AND_ENTRY_SERIALIZED_SIZE)?
-            .checked_add(core::mem::size_of::<u64>() as u64)?;
+        // Verify epoch matches target; if not, return None (layout mismatch or gap)
+        if entry_epoch != target_epoch { return None; }
 
-        let mut entry_buf = [0; EPOCH_AND_ENTRY_SERIALIZED_SIZE as usize];
-        // Use this module's Sysvar ID (not the program ID)
-        let result = get_sysvar(&mut entry_buf, &ID, offset, EPOCH_AND_ENTRY_SERIALIZED_SIZE);
-
-        match result {
-            Ok(()) => {
-                // All safe because `entry_buf` is a 32-length array
-                let entry_epoch = u64::from_le_bytes(entry_buf[0..8].try_into().unwrap());
-                let effective = u64::from_le_bytes(entry_buf[8..16].try_into().unwrap());
-                let activating = u64::from_le_bytes(entry_buf[16..24].try_into().unwrap());
-                let deactivating = u64::from_le_bytes(entry_buf[24..32].try_into().unwrap());
-
-                // this would only fail if stake history skipped an epoch or the binary format of the sysvar changed
-                assert_eq!(entry_epoch, target_epoch);
-
-                Some(StakeHistoryEntry {
-                    effective: effective.to_le_bytes(),
-                    activating: activating.to_le_bytes(),
-                    deactivating: deactivating.to_le_bytes(),
-                })
-            }
-            _ => None,
-        }
+        Some(StakeHistoryEntry {
+            effective: effective.to_le_bytes(),
+            activating: activating.to_le_bytes(),
+            deactivating: deactivating.to_le_bytes(),
+        })
     }
 }

@@ -4,7 +4,6 @@ use crate::error::{to_program_error, StakeError};
 use crate::helpers::{
     bytes_to_u64,
     checked_add,
-    constant::PERPETUAL_NEW_WARMUP_COOLDOWN_RATE_EPOCH,
 };
 use crate::helpers::merge::merge_delegation_stake_and_credits_observed;
 use crate::state::{
@@ -63,11 +62,17 @@ impl MergeKind {
                 // If a deactivation has been scheduled and we're at or before that epoch,
                 // this account is considered deactivating and not mergeable for move/merge.
                 if deact_epoch != u64::MAX {
+                    pinocchio::msg!("mk:deact set");
                     if clock.epoch <= deact_epoch {
+                        pinocchio::msg!("mk:deactivating");
                         return Err(to_program_error(StakeError::MergeMismatch));
                     } else {
+                        pinocchio::msg!("mk:post-deact -> IN");
+                        // Past the deactivation epoch: treat as inactive for merge classification
+                        return Ok(Self::Inactive(*meta, stake_lamports, *flags));
                     }
                 } else {
+                    pinocchio::msg!("mk:not deactivated");
                 }
                 if delegated > 0 && deact_epoch == u64::MAX && clock.epoch > act_epoch {
                     return Ok(Self::FullyActive(*meta, *stake));
@@ -75,7 +80,7 @@ impl MergeKind {
                 let status = stake.delegation.stake_activating_and_deactivating(
                     clock.epoch.to_le_bytes(),
                     stake_history,
-                    crate::helpers::constant::PERPETUAL_NEW_WARMUP_COOLDOWN_RATE_EPOCH,
+                    crate::helpers::PERPETUAL_NEW_WARMUP_COOLDOWN_RATE_EPOCH,
                 );
                 let effective    = crate::helpers::bytes_to_u64(status.effective);
                 let activating   = crate::helpers::bytes_to_u64(status.activating);
@@ -126,18 +131,27 @@ impl MergeKind {
     /// Metadata compatibility check for merge
     pub fn metas_can_merge(dest: &Meta, source: &Meta, clock: &Clock) -> ProgramResult {
         // Authorities must match exactly
-        if dest.authorized != source.authorized {
+        let auth_eq = dest.authorized == source.authorized;
+        if !auth_eq {
+            pinocchio::msg!("metas:auth_eq=0");
             return Err(to_program_error(StakeError::MergeMismatch));
         }
+        pinocchio::msg!("metas:auth_eq=1");
 
         // Lockups may differ, but both must be expired
-        let can_merge_lockups =
-            dest.lockup == source.lockup
-            || (!dest.lockup.is_in_force(clock, None) && !source.lockup.is_in_force(clock, None));
+        let lock_eq = dest.lockup == source.lockup;
+        let dest_in_force = dest.lockup.is_in_force(clock, None);
+        let src_in_force = source.lockup.is_in_force(clock, None);
+        let both_not_in_force = !dest_in_force && !src_in_force;
+        if lock_eq { pinocchio::msg!("metas:lock_eq=1"); } else { pinocchio::msg!("metas:lock_eq=0"); }
+        if dest_in_force { pinocchio::msg!("metas:dest_in_force=1"); } else { pinocchio::msg!("metas:dest_in_force=0"); }
+        if src_in_force { pinocchio::msg!("metas:src_in_force=1"); } else { pinocchio::msg!("metas:src_in_force=0"); }
 
-        if can_merge_lockups {
+        if lock_eq || both_not_in_force {
+            pinocchio::msg!("metas:lock_ok");
             Ok(())
         } else {
+            pinocchio::msg!("metas:lock_mismatch");
             Err(to_program_error(StakeError::MergeMismatch))
         }
     }

@@ -6,8 +6,7 @@ use pinocchio::{
 
 use crate::error::to_program_error;
 use crate::helpers::{
-    collect_signers, next_account_info, MAXIMUM_SIGNERS, validate_delegated_amount,
-    ValidatedDelegatedInfo,
+    collect_signers, MAXIMUM_SIGNERS, validate_delegated_amount, ValidatedDelegatedInfo,
 };
 use crate::helpers::utils::{
     get_stake_state, get_vote_credits, new_stake_with_credits, redelegate_stake_with_credits,
@@ -22,13 +21,46 @@ pub fn process_delegate(accounts: &[AccountInfo]) -> ProgramResult {
     let signers_count = collect_signers(accounts, &mut signers_array)?;
     let signers = &signers_array[..signers_count];
 
-    // Expected accounts: stake, vote, clock, stake_history, stake_config
-    let account_info_iter = &mut accounts.iter();
-    let stake_account_info = next_account_info(account_info_iter)?;
-    let vote_account_info = next_account_info(account_info_iter)?;
-    let clock_info = next_account_info(account_info_iter)?;
-    let _stake_history_info = next_account_info(account_info_iter)?;
-    let _stake_config_info = next_account_info(account_info_iter)?;
+    // Try canonical SDK order first: [stake, vote, clock, stake_history]
+    // - stake: writable, owned by this program
+    // - vote: owned by vote program id
+    // - clock: clock sysvar
+    // - stake_history: sysvar id (not read, epoch only via Clock)
+    let mut stake_account_info: Option<&AccountInfo> = None;
+    let mut vote_account_info: Option<&AccountInfo> = None;
+    let mut clock_info: Option<&AccountInfo> = None;
+
+    if accounts.len() >= 2 {
+        let stake_candidate = &accounts[0];
+        let vote_candidate = &accounts[1];
+        if *stake_candidate.owner() == crate::ID && stake_candidate.is_writable() {
+            // If vote in canonical position is not owned by the vote program, map to IncorrectProgramId
+            if *vote_candidate.owner() != crate::state::vote_state::vote_program_id() {
+                return Err(ProgramError::IncorrectProgramId);
+            }
+            stake_account_info = Some(stake_candidate);
+            vote_account_info = Some(vote_candidate);
+        }
+    }
+
+    // Tolerant account discovery fallback (any order): fill any missing slots
+    for ai in accounts.iter() {
+        if stake_account_info.is_none() && *ai.owner() == crate::ID && ai.is_writable() {
+            stake_account_info = Some(ai);
+            continue;
+        }
+        if vote_account_info.is_none() && *ai.owner() == crate::state::vote_state::vote_program_id() {
+            vote_account_info = Some(ai);
+            continue;
+        }
+        if clock_info.is_none() && ai.key() == &pinocchio::sysvars::clock::CLOCK_ID {
+            clock_info = Some(ai);
+            continue;
+        }
+    }
+    let stake_account_info = stake_account_info.ok_or(ProgramError::InvalidAccountData)?;
+    let vote_account_info = vote_account_info.ok_or(ProgramError::InvalidInstructionData)?;
+    let clock_info = clock_info.ok_or(ProgramError::InvalidInstructionData)?;
 
     let clock = &Clock::from_account_info(clock_info)?;
     let stake_history = &StakeHistorySysvar(clock.epoch);

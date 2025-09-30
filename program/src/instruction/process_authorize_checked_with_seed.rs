@@ -13,12 +13,12 @@ use crate::{
     state::{
         accounts::AuthorizeCheckedWithSeedData,
         stake_state_v2::StakeStateV2,
-        StakeAuthorize,
     },
 };
 
 /// Recreates `Pubkey::create_with_seed(base, seed, owner)` in Pinocchio:
 /// derived = sha256(base || seed || owner)
+#[allow(dead_code)]
 fn derive_with_seed_compat(base: &Pubkey, seed: &[u8], owner: &Pubkey) -> Result<Pubkey, ProgramError> {
     // Enforce max seed length 32 bytes
     if seed.len() > 32 {

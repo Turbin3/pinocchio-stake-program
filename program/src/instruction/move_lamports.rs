@@ -1,8 +1,8 @@
 
 extern crate alloc;
 
-use pinocchio::{account_info::AccountInfo, program_error::ProgramError, ProgramResult, sysvars::Sysvar};
-use crate::helpers::{next_account_info, relocate_lamports};
+use pinocchio::{account_info::AccountInfo, program_error::ProgramError, ProgramResult};
+use crate::helpers::relocate_lamports;
 use crate::helpers::merge::move_stake_or_lamports_shared_checks;
 use crate::state::merge_kind::MergeKind;
 
@@ -13,35 +13,23 @@ use crate::state::merge_kind::MergeKind;
 /// 1. `[writable]` Destination stake account (owned by this program)
 /// 2. `[signer]`   Staker authority (must be the *staker* of the source)
 pub fn process_move_lamports(accounts: &[AccountInfo], lamports: u64) -> ProgramResult {
-    // Parse accounts
-    let iter = &mut accounts.iter();
-    let source_stake_ai      = next_account_info(iter)?;
-    let destination_stake_ai = next_account_info(iter)?;
-    let staker_authority_ai  = next_account_info(iter)?;
+    // Canonical SDK order: [source_stake, destination_stake, staker]
+    let [source_stake_ai, destination_stake_ai, _rest @ ..] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
+    // Resolve the expected staker key from source meta and ensure that signer is present
+    let src_state = crate::helpers::get_stake_state(source_stake_ai)?;
+    let expected_staker = match src_state {
+        crate::state::stake_state_v2::StakeStateV2::Initialized(meta)
+        | crate::state::stake_state_v2::StakeStateV2::Stake(meta, _, _) => meta.authorized.staker,
+        _ => return Err(ProgramError::InvalidAccountData),
+    };
+    let staker_authority_ai = accounts
+        .iter()
+        .find(|ai| ai.is_signer() && ai.key() == &expected_staker)
+        .ok_or(ProgramError::MissingRequiredSignature)?;
 
-    // Pre-check: explicitly reject deactivating accounts (destination or source)
-    let clock = pinocchio::sysvars::clock::Clock::get()?;
-    // Ensure both are valid stake states and not transiently deactivating
-    for (idx, ai) in [source_stake_ai, destination_stake_ai].iter().enumerate() {
-        match crate::helpers::get_stake_state(ai)? {
-            // Stake: check deactivation window
-            crate::state::stake_state_v2::StakeStateV2::Stake(_, stake, _) => {
-                let deact = crate::helpers::bytes_to_u64(stake.delegation.deactivation_epoch);
-                if deact != u64::MAX && clock.epoch <= deact {
-                    return Err(crate::error::to_program_error(
-                        crate::error::StakeError::MergeMismatch,
-                    ));
-                }
-            }
-            // Initialized: permitted (no deactivation to check)
-            crate::state::stake_state_v2::StakeStateV2::Initialized(_) => {
-            }
-            // Uninitialized or other: invalid
-            _ => {
-                return Err(ProgramError::InvalidAccountData);
-            }
-        }
-    }
+    // Always perform checks via shared helper; reject transient shapes.
 
     // Shared checks (signer present, accounts distinct and writable, nonzero amount,
     // classification via MergeKind, and metadata compatibility)
@@ -53,6 +41,7 @@ pub fn process_move_lamports(accounts: &[AccountInfo], lamports: u64) -> Program
         true,  // enforce meta compatibility (authorities, lockups)
         false, // do not require mergeable classification
     )?;
+    // shared checks complete
 
     // Extra guard for lamports: require identical authorities between source and destination
     let src_auth = &source_kind.meta().authorized;
@@ -60,6 +49,12 @@ pub fn process_move_lamports(accounts: &[AccountInfo], lamports: u64) -> Program
     if src_auth != dst_auth {
         return Err(crate::error::to_program_error(crate::error::StakeError::MergeMismatch));
     }
+    pinocchio::msg!("ml:auths");
+    // Briefly tag source/destination (no pubkey formatting support, just markers)
+    pinocchio::msg!("ml:src");
+    let _ = source_stake_ai.key();
+    pinocchio::msg!("ml:dst");
+    let _ = destination_stake_ai.key();
 
     // (post-check logging removed; pre-check above handles transient)
 
@@ -68,37 +63,49 @@ pub fn process_move_lamports(accounts: &[AccountInfo], lamports: u64) -> Program
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    // Compute how many lamports are available to move from source:
-    //  - FullyActive: lamports - delegated - rent_exempt_reserve
-    //  - Inactive:   lamports - rent_exempt_reserve
-    //  - Activating/deactivating: not allowed
-    let source_free_lamports = match source_kind {
-        MergeKind::FullyActive(ref meta, ref stake) => {
-            let rent_reserve = u64::from_le_bytes(meta.rent_exempt_reserve);
-            let delegated    = u64::from_le_bytes(stake.delegation.stake);
-
-            source_stake_ai
-                .lamports()
-                .saturating_sub(delegated)
-                .saturating_sub(rent_reserve)
-        }
-        MergeKind::Inactive(ref meta, source_lamports, _flags) => {
-            let rent_reserve = u64::from_le_bytes(meta.rent_exempt_reserve);
-            source_lamports.saturating_sub(rent_reserve)
-        }
-        _ => {
-            // Partially activating/deactivating is not allowed for MoveLamports
-            return Err(crate::error::to_program_error(crate::error::StakeError::MergeMismatch));
+    // Compute withdrawable lamports from source using the earlier classification
+    // - FullyActive: total - rent - max(delegated, min_delegation)
+    // - Inactive (Initialized or post-deactivation): total - rent
+    // - ActivationEpoch: reject (transient)
+    let source_free_lamports = {
+        let total = source_stake_ai.lamports();
+        match &source_kind {
+            MergeKind::Inactive(meta, _stake_lamports, _flags) => {
+                let rent_reserve = u64::from_le_bytes(meta.rent_exempt_reserve);
+                pinocchio::msg!("ml:inact");
+                total.saturating_sub(rent_reserve)
+            }
+            MergeKind::FullyActive(meta, stake) => {
+                let rent_reserve = u64::from_le_bytes(meta.rent_exempt_reserve);
+                let delegated = crate::helpers::bytes_to_u64(stake.delegation.stake);
+                if delegated == 0 { pinocchio::msg!("ml:deleg0"); } else { pinocchio::msg!("ml:delegN"); }
+                pinocchio::msg!("ml:fa");
+                let assumed = core::cmp::max(delegated, crate::helpers::get_minimum_delegation());
+                total.saturating_sub(rent_reserve).saturating_sub(assumed)
+            }
+            MergeKind::ActivationEpoch(_, _, _) => {
+                pinocchio::msg!("ml:transient_act");
+                return Err(crate::error::to_program_error(crate::error::StakeError::MergeMismatch));
+            }
         }
     };
+    // Emit comparison markers for tests
+    pinocchio::msg!("ml:amt");
+    let _ = lamports;
+    pinocchio::msg!("ml:free");
+    // computed free
 
     // Amount must be within the available budget
     if lamports > source_free_lamports {
+        pinocchio::msg!("ml:overshoot");
         return Err(ProgramError::InvalidArgument);
     }
+    pinocchio::msg!("ml:within");
 
-    // Move lamports
+    // Move lamports (declared direction only)
+    pinocchio::msg!("ml:relocate");
     relocate_lamports(source_stake_ai, destination_stake_ai, lamports)?;
+    // relocated
 
     // Post-condition: both accounts must remain at/above their rent reserves
     let src_meta = source_kind.meta();

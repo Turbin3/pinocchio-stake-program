@@ -212,6 +212,7 @@ pub fn get_vote_credits(vote_account_info: &AccountInfo) -> Result<u64, ProgramE
 }
 
 #[inline]
+#[allow(dead_code)]
 fn parse_epoch_credits_triplets(buf: &[u8], n: usize) -> Option<u64> {
     let need = 24usize.checked_mul(n)?;
     if buf.len() < need { return None; }

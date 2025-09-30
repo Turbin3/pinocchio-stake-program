@@ -25,32 +25,46 @@ pub fn process_authorize(
     accounts: &[AccountInfo],
     new_authority: Pubkey,
     authority_type: StakeAuthorize,
-) -> ProgramResult { 
-    if accounts.len() < 2 {
-        return Err(ProgramError::NotEnoughAccountKeys);
-    }
-    let [stake_ai, clock_ai, rest @ ..] = accounts else {
-        return Err(ProgramError::InvalidAccountData);
-    };
+) -> ProgramResult {
+    if accounts.len() < 2 { return Err(ProgramError::NotEnoughAccountKeys); }
 
-    if *stake_ai.owner() != crate::ID || !stake_ai.is_writable() {
-        return Err(ProgramError::IncorrectProgramId);
+    // Find stake (owned by this program and writable) and clock sysvar anywhere in the list
+    let mut stake_idx: Option<usize> = None;
+    let mut clock_idx: Option<usize> = None;
+    for (i, ai) in accounts.iter().enumerate() {
+        if stake_idx.is_none() && *ai.owner() == crate::ID && ai.is_writable() {
+            stake_idx = Some(i);
+        }
+        if clock_idx.is_none() && ai.key() == &pinocchio::sysvars::clock::CLOCK_ID {
+            clock_idx = Some(i);
+        }
+        if stake_idx.is_some() && clock_idx.is_some() { break; }
     }
-    if clock_ai.key() != &pinocchio::sysvars::clock::CLOCK_ID {
-        return Err(ProgramError::InvalidArgument);
-    }
+    let stake_ai = accounts.get(stake_idx.ok_or(ProgramError::InvalidAccountData)?)
+        .ok_or(ProgramError::InvalidAccountData)?;
+    let clock_ai = accounts.get(clock_idx.ok_or(ProgramError::InvalidInstructionData)?)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+    if *stake_ai.owner() != crate::ID || !stake_ai.is_writable() { return Err(ProgramError::IncorrectProgramId); }
     let clock = unsafe { Clock::from_account_info_unchecked(clock_ai)? };
 
-    // Optional lockup custodian (as a reference)
-    let maybe_lockup_authority: Option<&AccountInfo> = rest.first();
+    // Load state to identify the expected lockup custodian; pass it if present and signer
+    let state = get_stake_state(stake_ai)?;
+    let custodian_pk = match &state {
+        StakeStateV2::Initialized(meta) => meta.lockup.custodian,
+        StakeStateV2::Stake(meta, _, _) => meta.lockup.custodian,
+        _ => Pubkey::default(),
+    };
+    let maybe_lockup_authority: Option<&AccountInfo> = accounts
+        .iter()
+        .find(|ai| ai.key() == &custodian_pk && ai.is_signer());
 
-    // Collect all signers
-    let mut signers_buf = [Pubkey::default(); MAXIMUM_SIGNERS];// Stack allocated
+    // Collect all tx signers
+    let mut signers_buf = [Pubkey::default(); MAXIMUM_SIGNERS];
     let n = collect_signers(accounts, &mut signers_buf)?;
     let signers = &signers_buf[..n];
 
-    // Load, update, store
-    match get_stake_state(stake_ai)? {
+    // Update and store
+    match state {
         StakeStateV2::Initialized(mut meta) => {
             authorize_update(
                 &mut meta,

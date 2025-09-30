@@ -1,11 +1,11 @@
 
+extern crate alloc;
 use pinocchio::{account_info::AccountInfo, program_error::ProgramError, ProgramResult, sysvars::Sysvar};
 
 use crate::error::{to_program_error, StakeError};
 use crate::helpers::{
     bytes_to_u64,
     get_minimum_delegation,
-    next_account_info,
     relocate_lamports, // use shared helper, not a local copy
     set_stake_state,
     get_stake_state,
@@ -17,11 +17,34 @@ use crate::helpers::merge::{
 use crate::state::{MergeKind, StakeFlags, StakeStateV2};
 
 pub fn process_move_stake(accounts: &[AccountInfo], lamports: u64) -> ProgramResult {
-    let it = &mut accounts.iter();
-    // Expected accounts: 3
-    let source_stake_account_info = next_account_info(it)?;
-    let destination_stake_account_info = next_account_info(it)?;
-    let stake_authority_info = next_account_info(it)?;
+    pinocchio::msg!("mvstake:begin");
+    // Discover accounts by role without heap: two writable stake accounts and signer authority
+    let mut first: Option<&AccountInfo> = None;
+    let mut second: Option<&AccountInfo> = None;
+    let mut stake_authority_info: Option<&AccountInfo> = None;
+    for ai in accounts.iter() {
+        if ai.is_signer() && stake_authority_info.is_none() {
+            stake_authority_info = Some(ai);
+        }
+        if *ai.owner() == crate::ID && ai.is_writable() {
+            if first.is_none() { first = Some(ai); continue; }
+            if second.is_none() { second = Some(ai); continue; }
+        }
+    }
+    let source_stake_account_info = first.ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let destination_stake_account_info = second.ok_or(ProgramError::NotEnoughAccountKeys)?;
+    pinocchio::msg!("mvstake:accs");
+    // Resolve expected staker from source stake meta and ensure signer present
+    let src_state = get_stake_state(source_stake_account_info)?;
+    let expected_staker = match src_state {
+        StakeStateV2::Initialized(meta) | StakeStateV2::Stake(meta, _, _) => meta.authorized.staker,
+        _ => return Err(ProgramError::InvalidAccountData),
+    };
+    let stake_authority_info = accounts
+        .iter()
+        .find(|ai| ai.is_signer() && ai.key() == &expected_staker)
+        .ok_or(ProgramError::MissingRequiredSignature)?;
+    pinocchio::msg!("mvstake:auth");
 
     // Verify signer status is provided by the runtime
     if stake_authority_info.is_signer() {
@@ -49,6 +72,7 @@ pub fn process_move_stake(accounts: &[AccountInfo], lamports: u64) -> ProgramRes
         true,  // need meta compat for stake
         true,  // require mergeable classification
     )?;
+    pinocchio::msg!("mvstake:classified");
 
     // Additional explicit guard (post-signer-check): destination must not be deactivating
     if let Ok(StakeStateV2::Stake(_, stake, _)) = get_stake_state(destination_stake_account_info) {

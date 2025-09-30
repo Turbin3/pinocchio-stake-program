@@ -17,4 +17,4 @@ async fn initialize_harness_boots() {
     assert!(sim.simulation_details.unwrap().return_data.is_some());
 }
 
-// Additional initialize flow tests will be added here after wiring required accounts
+// Additional initialize flow tests can be added here.

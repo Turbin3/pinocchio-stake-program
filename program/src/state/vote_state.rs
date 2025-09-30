@@ -43,14 +43,12 @@ pub struct VoteState {
 }
 
 impl VoteState {
-      #[inline]
     pub fn credits(&self) -> u64 {
         match self.epoch_credits.as_slice().last() {
             Some((_, credits, _prev)) => *credits,
             None => 0,
         }
     }
-       #[inline]
     pub fn credits_for_epoch(&self, epoch: u64) -> Option<u64> {
         self.epoch_credits
             .as_slice()
@@ -58,25 +56,21 @@ impl VoteState {
             .find(|(e, _, _)| *e == epoch)
             .map(|(_, credits, _)| *credits)
     }
-    #[inline]
     pub fn epoch_credits_as_slice(&self) -> &[EpochCredits] {
         self.epoch_credits.as_slice()
     }
 
-    #[inline]
     pub fn from_account_info(ai: &AccountInfo) -> Result<Self, ProgramError> {
         let data = ai.try_borrow_data()?;
         Self::from_bytes(&data)
     }
 
-    #[inline]
     pub fn from_bytes(data: &[u8]) -> Result<Self, ProgramError> {
         let list = parse_epoch_credits(data).ok_or(ProgramError::InvalidAccountData)?;
         Ok(Self { epoch_credits: list })
     }
 }
 
-#[inline]
 pub fn parse_epoch_credits(data: &[u8]) -> Option<EpochCreditsList> {
     if data.len() < 4 {
         return None;
@@ -104,12 +98,10 @@ pub fn parse_epoch_credits(data: &[u8]) -> Option<EpochCreditsList> {
     Some(list)
 }
 
-#[inline]
 pub fn parse_epoch_credits_slice(data: &[u8]) -> Option<EpochCreditsList> {
     parse_epoch_credits(data)
 }
 
-#[inline]
 declare_id!("Vote111111111111111111111111111111111111111");
 
 pub fn vote_program_id() -> Pubkey {

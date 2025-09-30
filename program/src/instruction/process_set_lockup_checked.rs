@@ -20,6 +20,7 @@ pub struct LockupCheckedData {
 }
 
 impl LockupCheckedData {
+    #[allow(unused_assignments)]
     fn parse(data: &[u8]) -> Result<Self, ProgramError> {
         if data.is_empty() {
             return Err(ProgramError::InvalidInstructionData);

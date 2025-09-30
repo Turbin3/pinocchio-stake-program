@@ -12,7 +12,7 @@ use pinocchio::{
 
 use crate::{
     error::{to_program_error, StakeError},
-    helpers::{get_stake_state, next_account_info, set_stake_state},
+    helpers::{get_stake_state, set_stake_state},
     state::{
         stake_state_v2::StakeStateV2,
         vote_state::vote_program_id,
@@ -23,17 +23,29 @@ use crate::helpers::constant::MINIMUM_DELINQUENT_EPOCHS_FOR_DEACTIVATION;
 pub fn process_deactivate_delinquent(accounts: &[AccountInfo]) -> ProgramResult {
     msg!("Instruction: DeactivateDelinquent");
 
-    // --- Accounts: stake, delinquent_vote, reference_vote ---
-    let iter = &mut accounts.iter();
-    let stake_ai           = next_account_info(iter)?;
-    let delinquent_vote_ai = next_account_info(iter)?;
-    let reference_vote_ai  = next_account_info(iter)?;
+    // --- Discover accounts by role ---
+    let vote_pid = vote_program_id();
+    let mut stake_ai: Option<&AccountInfo> = None;
+    let mut delinquent_vote_ai: Option<&AccountInfo> = None;
+    let mut reference_vote_ai: Option<&AccountInfo> = None;
+    for ai in accounts.iter() {
+        if stake_ai.is_none() && *ai.owner() == crate::ID && ai.is_writable() {
+            stake_ai = Some(ai);
+            continue;
+        }
+        if vote_pid != Pubkey::default() && *ai.owner() == vote_pid {
+            if delinquent_vote_ai.is_none() { delinquent_vote_ai = Some(ai); continue; }
+            if reference_vote_ai.is_none() { reference_vote_ai = Some(ai); continue; }
+        }
+    }
+    let stake_ai = stake_ai.ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let delinquent_vote_ai = delinquent_vote_ai.ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let reference_vote_ai = reference_vote_ai.ok_or(ProgramError::NotEnoughAccountKeys)?;
 
     // --- Clock (use current epoch) ---
     let clock = Clock::get()?;
 
     // --- Optional owner check for vote accounts ---
-    let vote_pid = vote_program_id();
     if vote_pid != Pubkey::default() {
         if *reference_vote_ai.owner() != vote_pid || *delinquent_vote_ai.owner() != vote_pid {
             return Err(ProgramError::IncorrectProgramId);

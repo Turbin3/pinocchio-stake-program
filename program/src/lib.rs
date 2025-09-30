@@ -18,7 +18,8 @@ pinocchio_pubkey::declare_id!("Stake11111111111111111111111111111111111111");
 #[cfg(feature = "sbf")]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    // On-chain panic: spin forever (abort semantics)
+    // On-chain panic: emit a marker, then spin (abort semantics)
+    pinocchio::msg!("panic:handler");
     loop {}
 }
 

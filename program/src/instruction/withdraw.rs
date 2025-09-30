@@ -8,7 +8,7 @@ use pinocchio::{
 
 use crate::{
     error::{to_program_error, StakeError},
-    helpers::{checked_add, get_stake_state, next_account_info, relocate_lamports, set_stake_state},
+    helpers::{checked_add, get_stake_state, relocate_lamports, set_stake_state},
     state::{Lockup, StakeAuthorize, StakeHistorySysvar, StakeStateV2},
 
 };
@@ -17,17 +17,43 @@ use pinocchio::pubkey::Pubkey;
 //
 
 pub fn process_withdraw(accounts: &[AccountInfo], withdraw_lamports: u64) -> ProgramResult {
-    msg!("Withdraw: enter");
-    let account_info_iter = &mut accounts.iter();
+    #[cfg(feature = "cu-trace")] msg!("Withdraw: enter");
+    // Discover accounts by role (tolerant to order):
+    let mut source_stake_account_info: Option<&AccountInfo> = None;
+    let mut destination_info: Option<&AccountInfo> = None;
+    let mut clock_info: Option<&AccountInfo> = None;
 
-    // Expected accounts: 5 (including 2 sysvars)
-    let source_stake_account_info = next_account_info(account_info_iter)?;
-    let destination_info = next_account_info(account_info_iter)?;
-    let clock_info = next_account_info(account_info_iter)?;
-    let _stake_history_info = next_account_info(account_info_iter)?;
-    let withdraw_authority_info = next_account_info(account_info_iter)?;
-    // other accounts (optional)
-    let option_lockup_authority_info = next_account_info(account_info_iter).ok();
+    // Identify stake and destination
+    for ai in accounts.iter() {
+        if source_stake_account_info.is_none() && *ai.owner() == crate::ID && ai.is_writable() {
+            source_stake_account_info = Some(ai);
+            continue;
+        }
+    }
+    // Requires stake to be found to avoid picking it as destination
+    let stake_key = source_stake_account_info
+        .ok_or(ProgramError::InvalidAccountData)?
+        .key();
+
+    for ai in accounts.iter() {
+        if clock_info.is_none() && ai.key() == &pinocchio::sysvars::clock::CLOCK_ID {
+            clock_info = Some(ai);
+            continue;
+        }
+        // Destination: first writable non-stake and non-sysvar account
+        if destination_info.is_none()
+            && ai.is_writable()
+            && ai.key() != stake_key
+            && ai.key() != &pinocchio::sysvars::clock::CLOCK_ID
+            && ai.key() != &crate::state::stake_history::ID
+        {
+            destination_info = Some(ai);
+        }
+    }
+
+    let source_stake_account_info = source_stake_account_info.ok_or(ProgramError::InvalidAccountData)?;
+    let destination_info = destination_info.ok_or(ProgramError::InvalidInstructionData)?;
+    let clock_info = clock_info.ok_or(ProgramError::InvalidInstructionData)?;
 
     // Fast path: Uninitialized source with source signer — no sysvars needed
     match get_stake_state(source_stake_account_info) {
@@ -46,39 +72,21 @@ pub fn process_withdraw(accounts: &[AccountInfo], withdraw_lamports: u64) -> Pro
         _ => {}
     }
 
-    msg!("Withdraw: load clock");
+    #[cfg(feature = "cu-trace")] msg!("Withdraw: load clock");
     let clock = &Clock::from_account_info(clock_info)?;
     let stake_history = &StakeHistorySysvar(clock.epoch);
 
-    // Require withdraw authority signer; if custodian account is supplied it must also be a signer
-    msg!("Withdraw: gather signers");
-    let mut signer_keys: [Pubkey; 2] = [Pubkey::default(); 2];
-    let mut n = 0usize;
-    if withdraw_authority_info.is_signer() {
-        signer_keys[n] = *withdraw_authority_info.key();
-        n += 1;
-    } else {
-        return Err(ProgramError::MissingRequiredSignature);
-    }
-    let custodian: Option<&Pubkey> = match option_lockup_authority_info {
-        Some(ai) => {
-            if ai.is_signer() {
-                signer_keys[n] = *ai.key();
-                n += 1;
-                Some(ai.key())
-            } else {
-                return Err(ProgramError::MissingRequiredSignature);
-            }
-        }
-        None => None,
-    };
-    let signers_slice: &[Pubkey] = &signer_keys[..n];
+    // Collect all transaction signers and determine optional custodian by state
+    #[cfg(feature = "cu-trace")] msg!("Withdraw: gather signers");
+    let mut signers_vec = [Pubkey::default(); crate::helpers::MAXIMUM_SIGNERS];
+    let n_signers = crate::helpers::collect_signers(accounts, &mut signers_vec)?;
+    let signers_slice: &[Pubkey] = &signers_vec[..n_signers];
 
     // Decide withdrawal constraints based on current stake state
-    msg!("Withdraw: read state");
+    #[cfg(feature = "cu-trace")] msg!("Withdraw: read state");
     let (lockup, reserve_u64, is_staked) = match get_stake_state(source_stake_account_info)? {
         StakeStateV2::Stake(meta, stake, _stake_flags) => {
-            msg!("Withdraw: state=Stake");
+            #[cfg(feature = "cu-trace")] msg!("Withdraw: state=Stake");
             // Must have withdraw authority
             meta.authorized
                 .check(signers_slice, StakeAuthorize::Withdrawer)
@@ -106,7 +114,7 @@ pub fn process_withdraw(accounts: &[AccountInfo], withdraw_lamports: u64) -> Pro
             (meta.lockup, staked_plus_reserve, staked != 0)
         }
         StakeStateV2::Initialized(meta) => {
-            msg!("Withdraw: state=Initialized");
+            #[cfg(feature = "cu-trace")] msg!("Withdraw: state=Initialized");
             // Must have withdraw authority
             meta.authorized
                 .check(signers_slice, StakeAuthorize::Withdrawer)
@@ -126,7 +134,12 @@ pub fn process_withdraw(accounts: &[AccountInfo], withdraw_lamports: u64) -> Pro
     };
 
     // Lockup must be expired or bypassed by a custodian signer
-    msg!("Withdraw: check lockup");
+    #[cfg(feature = "cu-trace")] msg!("Withdraw: check lockup");
+    // Determine if a custodian signer is present among accounts
+    let custodian = accounts
+        .iter()
+        .find(|ai| ai.is_signer() && ai.key() == &lockup.custodian)
+        .map(|ai| ai.key());
     if lockup.is_in_force(clock, custodian) {
         return Err(to_program_error(StakeError::LockupInForce));
     }
@@ -134,7 +147,7 @@ pub fn process_withdraw(accounts: &[AccountInfo], withdraw_lamports: u64) -> Pro
     let stake_account_lamports = source_stake_account_info.lamports();
 
     if withdraw_lamports == stake_account_lamports {
-        msg!("Withdraw: full");
+        #[cfg(feature = "cu-trace")] msg!("Withdraw: full");
         // Full withdrawal: can't close if still staked
         if is_staked {
             return Err(ProgramError::InsufficientFunds);
@@ -142,7 +155,7 @@ pub fn process_withdraw(accounts: &[AccountInfo], withdraw_lamports: u64) -> Pro
         // Deinitialize state upon zero balance
         set_stake_state(source_stake_account_info, &StakeStateV2::Uninitialized)?;
     } else {
-        msg!("Withdraw: partial");
+        #[cfg(feature = "cu-trace")] msg!("Withdraw: partial");
         // Partial withdrawal must not deplete the reserve
         let withdraw_plus_reserve = checked_add(withdraw_lamports, reserve_u64)?;
         if withdraw_plus_reserve > stake_account_lamports {
@@ -151,13 +164,13 @@ pub fn process_withdraw(accounts: &[AccountInfo], withdraw_lamports: u64) -> Pro
     }
 
     // Move lamports after state update
-    msg!("Withdraw: relocate lamports");
+    #[cfg(feature = "cu-trace")] msg!("Withdraw: relocate lamports");
     relocate_lamports(
         source_stake_account_info,
         destination_info,
         withdraw_lamports,
     )?;
 
-    msg!("Withdraw: ok");
+    #[cfg(feature = "cu-trace")] msg!("Withdraw: ok");
     Ok(())
 }

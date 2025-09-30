@@ -12,49 +12,17 @@ use solana_sdk::{
 pub mod ixn {
     use super::*;
 
-    #[inline]
-    fn rebuild_accounts_order(accounts: &mut Vec<AccountMeta>, head: &[Pubkey]) {
-        let mut new = Vec::with_capacity(accounts.len());
-        for k in head {
-            if let Some(pos) = accounts.iter().position(|am| &am.pubkey == k) {
-                new.push(accounts.remove(pos));
-            }
-        }
-        new.append(accounts);
-        *accounts = new;
-    }
-
-    #[inline]
-    fn role_byte(role: &StakeAuthorize) -> u8 {
-        match role {
-            StakeAuthorize::Staker => 0,
-            StakeAuthorize::Withdrawer => 1,
-        }
-    }
 
     pub fn get_minimum_delegation() -> Instruction {
-        let mut ix = sdk_ixn::get_minimum_delegation();
-        ix.data = vec![13];
-        ix
+        sdk_ixn::get_minimum_delegation()
     }
 
     pub fn initialize(stake: &Pubkey, authorized: &Authorized, lockup: &Lockup) -> Instruction {
-        let mut ix = sdk_ixn::initialize(stake, authorized, lockup);
-        let mut data = Vec::with_capacity(1 + 112);
-        data.push(0);
-        data.extend_from_slice(&authorized.staker.to_bytes());
-        data.extend_from_slice(&authorized.withdrawer.to_bytes());
-        data.extend_from_slice(&lockup.unix_timestamp.to_le_bytes());
-        data.extend_from_slice(&lockup.epoch.to_le_bytes());
-        data.extend_from_slice(&lockup.custodian.to_bytes());
-        ix.data = data;
-        ix
+        sdk_ixn::initialize(stake, authorized, lockup)
     }
 
     pub fn initialize_checked(stake: &Pubkey, authorized: &Authorized) -> Instruction {
-        let mut ix = sdk_ixn::initialize_checked(stake, authorized);
-        ix.data = vec![9];
-        ix
+        sdk_ixn::initialize_checked(stake, authorized)
     }
 
     pub fn authorize(
@@ -65,14 +33,6 @@ pub mod ixn {
         custodian: Option<&Pubkey>,
     ) -> Instruction {
         let mut ix = sdk_ixn::authorize(stake, authority, new_authorized, role, custodian);
-        let mut accts = ix.accounts.clone();
-        rebuild_accounts_order(&mut accts, &[*stake, solana_sdk::sysvar::clock::id()]);
-        ix.accounts = accts;
-        let mut data = Vec::with_capacity(1 + 33);
-        data.push(1);
-        data.extend_from_slice(&new_authorized.to_bytes());
-        data.push(role_byte(&role));
-        ix.data = data;
         ix
     }
 
@@ -84,13 +44,6 @@ pub mod ixn {
         custodian: Option<&Pubkey>,
     ) -> Instruction {
         let mut ix = sdk_ixn::authorize_checked(stake, authority, new_authorized, role, custodian);
-        let mut accts = ix.accounts.clone();
-        rebuild_accounts_order(
-            &mut accts,
-            &[*stake, solana_sdk::sysvar::clock::id(), *authority, *new_authorized],
-        );
-        ix.accounts = accts;
-        ix.data = vec![10, role_byte(&role)];
         ix
     }
 
@@ -112,21 +65,6 @@ pub mod ixn {
             role,
             custodian,
         );
-        let mut accts = ix.accounts.clone();
-        rebuild_accounts_order(
-            &mut accts,
-            &[*stake, *base, solana_sdk::sysvar::clock::id(), *new_authorized],
-        );
-        ix.accounts = accts;
-        let seed_bytes = seed.as_bytes();
-        let mut data = Vec::with_capacity(1 + 32 + 1 + 1 + seed_bytes.len() + 32);
-        data.push(11);
-        data.extend_from_slice(&new_authorized.to_bytes());
-        data.push(role_byte(&role));
-        data.push(u8::try_from(seed_bytes.len()).unwrap());
-        data.extend_from_slice(seed_bytes);
-        data.extend_from_slice(&owner.to_bytes());
-        ix.data = data;
         ix
     }
 
@@ -140,87 +78,22 @@ pub mod ixn {
         role: StakeAuthorize,
         _custodian: Option<&Pubkey>,
     ) -> Instruction {
-        // Build explicit minimal metas for non-checked variant: [stake (w), base (s), clock]
-        let mut ix = Instruction {
-            program_id: stake_program_id(),
-            accounts: vec![
-                AccountMeta::new(*stake, false),
-                AccountMeta::new_readonly(*base, true),
-                AccountMeta::new_readonly(solana_sdk::sysvar::clock::id(), false),
-            ],
-            data: vec![],
-        };
-        let seed_bytes = seed.as_bytes();
-        let mut data = Vec::with_capacity(1 + 32 + 1 + 1 + seed_bytes.len() + 32);
-        data.push(8); // non-checked discriminant
-        data.extend_from_slice(&new_authorized.to_bytes());
-        data.push(role_byte(&role));
-        data.push(u8::try_from(seed_bytes.len()).unwrap());
-        data.extend_from_slice(seed_bytes);
-        data.extend_from_slice(&owner.to_bytes());
-        ix.data = data;
-        ix
+        sdk_ixn::authorize_with_seed(stake, base, seed, owner, new_authorized, role, _custodian)
     }
 
     pub fn set_lockup_checked(stake: &Pubkey, args: &solana_sdk::stake::instruction::LockupArgs, signer: &Pubkey) -> Instruction {
         let mut ix = sdk_ixn::set_lockup_checked(stake, args, signer);
-        let mut data = Vec::with_capacity(1 + 1 + 16);
-        data.push(12);
-        let mut flags = 0u8;
-        if args.unix_timestamp.is_some() { flags |= 0x01; }
-        if args.epoch.is_some() { flags |= 0x02; }
-        data.push(flags);
-        if let Some(ts) = args.unix_timestamp { data.extend_from_slice(&ts.to_le_bytes()); }
-        if let Some(ep) = args.epoch { data.extend_from_slice(&ep.to_le_bytes()); }
-        ix.data = data;
         ix
     }
 
     pub fn delegate_stake(stake: &Pubkey, staker: &Pubkey, vote: &Pubkey) -> Instruction {
-        let mut ix = sdk_ixn::delegate_stake(stake, staker, vote);
-        // Expected by program: [stake, vote, clock, stake_history, stake_config, ...]
-        let mut accts = ix.accounts.clone();
-        rebuild_accounts_order(
-            &mut accts,
-            &[
-                *stake,
-                *vote,
-                solana_sdk::sysvar::clock::id(),
-                solana_sdk::sysvar::stake_history::id(),
-                solana_sdk::stake::config::id(),
-            ],
-        );
-        // Ensure stake_config is present (some SDKs may omit it from delegate metas)
-        if !accts.iter().any(|am| am.pubkey == solana_sdk::stake::config::id()) {
-            accts.push(AccountMeta::new_readonly(solana_sdk::stake::config::id(), false));
-        }
-        ix.accounts = accts;
-        ix.data = vec![2];
-        ix
+        // Use native metas and wire
+        sdk_ixn::delegate_stake(stake, staker, vote)
     }
 
     pub fn split(stake: &Pubkey, authority: &Pubkey, lamports: u64, split_dest: &Pubkey) -> Vec<Instruction> {
-        // Build via SDK and translate the stake-program instruction payload and
-        // account ordering to our program's format. Also, ensure the stake
-        // instruction is first in the vector so tests can `.next()` it.
-        let mut v = sdk_ixn::split(stake, authority, lamports, split_dest);
-
-        // Patch stake-program instruction(s)
-        for i in &mut v {
-            if i.program_id == stake_program_id() {
-                // Ensure account ordering starts with [stake, split_dest, authority]
-                let mut accts = i.accounts.clone();
-                rebuild_accounts_order(&mut accts, &[*stake, *split_dest, *authority]);
-                i.accounts = accts;
-                // Overwrite data with Pinocchio discriminator + lamports
-                let mut data = Vec::with_capacity(1 + 8);
-                data.push(3);
-                data.extend_from_slice(&lamports.to_le_bytes());
-                i.data = data;
-            }
-        }
-
-        v
+        // Use native metas and wire
+        sdk_ixn::split(stake, authority, lamports, split_dest)
     }
 
     pub fn withdraw(
@@ -230,34 +103,12 @@ pub mod ixn {
         lamports: u64,
         custodian: Option<&Pubkey>,
     ) -> Instruction {
-        let mut ix = sdk_ixn::withdraw(stake, withdrawer, recipient, lamports, custodian);
-        // Expected by program: [stake, recipient, clock, stake_history, withdrawer, (custodian?)]
-        let mut accts = ix.accounts.clone();
-        let mut head = vec![
-            *stake,
-            *recipient,
-            solana_sdk::sysvar::clock::id(),
-            solana_sdk::sysvar::stake_history::id(),
-            *withdrawer,
-        ];
-        if let Some(c) = custodian { head.push(*c); }
-        rebuild_accounts_order(&mut accts, &head);
-        ix.accounts = accts;
-        let mut data = Vec::with_capacity(1 + 8);
-        data.push(4);
-        data.extend_from_slice(&lamports.to_le_bytes());
-        ix.data = data;
-        ix
+        // Use native metas and wire
+        sdk_ixn::withdraw(stake, withdrawer, recipient, lamports, custodian)
     }
 
     pub fn deactivate_stake(stake: &Pubkey, staker: &Pubkey) -> Instruction {
-        let mut ix = sdk_ixn::deactivate_stake(stake, staker);
-        // Expected by program: [stake, clock, ...]
-        let mut accts = ix.accounts.clone();
-        rebuild_accounts_order(&mut accts, &[*stake, solana_sdk::sysvar::clock::id()]);
-        ix.accounts = accts;
-        ix.data = vec![5];
-        ix
+        sdk_ixn::deactivate_stake(stake, staker)
     }
 
     // Convenience alias matching native name
@@ -266,65 +117,31 @@ pub mod ixn {
     }
 
     pub fn merge(dest: &Pubkey, src: &Pubkey, authority: &Pubkey) -> Vec<Instruction> {
-        let mut v = sdk_ixn::merge(dest, src, authority);
-        for i in &mut v {
-            if i.program_id == stake_program_id() {
-                let mut accts = i.accounts.clone();
-                rebuild_accounts_order(
-                    &mut accts,
-                    &[*dest, *src, solana_sdk::sysvar::clock::id(), solana_sdk::sysvar::stake_history::id()],
-                );
-                i.accounts = accts;
-                i.data = vec![7];
-            }
-        }
-        v
+        // Use native metas and wire
+        sdk_ixn::merge(dest, src, authority)
     }
 
     pub fn move_stake(source: &Pubkey, dest: &Pubkey, staker: &Pubkey, lamports: u64) -> Instruction {
-        let mut ix = sdk_ixn::move_stake(source, dest, staker, lamports);
-        // Replace metas with exactly what our program expects
-        ix.accounts = vec![
-            AccountMeta::new(*source, false),
-            AccountMeta::new(*dest, false),
-            AccountMeta::new_readonly(*staker, true),
-        ];
-        let mut data = Vec::with_capacity(1 + 8);
-        data.push(16);
-        data.extend_from_slice(&lamports.to_le_bytes());
-        ix.data = data;
-        ix
+        sdk_ixn::move_stake(source, dest, staker, lamports)
     }
 
     pub fn move_lamports(source: &Pubkey, dest: &Pubkey, staker: &Pubkey, lamports: u64) -> Instruction {
-        let mut ix = sdk_ixn::move_lamports(source, dest, staker, lamports);
-        // Expected by program: [source, dest, staker]
-        let mut accts = ix.accounts.clone();
-        rebuild_accounts_order(&mut accts, &[*source, *dest, *staker]);
-        ix.accounts = accts;
-        let mut data = Vec::with_capacity(1 + 8);
-        data.push(17);
-        data.extend_from_slice(&lamports.to_le_bytes());
-        ix.data = data;
-        ix
+        sdk_ixn::move_lamports(source, dest, staker, lamports)
     }
 
     // DeactivateDelinquent: [stake, delinquent_vote, reference_vote]
     pub fn deactivate_delinquent(stake: &Pubkey, delinquent_vote: &Pubkey, reference_vote: &Pubkey) -> Instruction {
-        let mut ix = Instruction {
+        // Build native-ABI instruction data via bincode (SDK may not expose this helper)
+        Instruction {
             program_id: stake_program_id(),
             accounts: vec![
                 AccountMeta::new(*stake, false),
                 AccountMeta::new_readonly(*delinquent_vote, false),
                 AccountMeta::new_readonly(*reference_vote, false),
             ],
-            data: vec![14u8],
-        };
-        // Ensure order exactly as program expects
-        let mut accts = ix.accounts.clone();
-        rebuild_accounts_order(&mut accts, &[*stake, *delinquent_vote, *reference_vote]);
-        ix.accounts = accts;
-        ix
+            data: bincode::serialize(&solana_sdk::stake::instruction::StakeInstruction::DeactivateDelinquent)
+                .expect("serialize DeactivateDelinquent"),
+        }
     }
 }
 

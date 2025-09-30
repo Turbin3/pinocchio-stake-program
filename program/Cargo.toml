@@ -13,8 +13,9 @@ pinocchio-pubkey = "0.3.0"
 pinocchio-system = "0.3.0"
 pinocchio-token = "0.4.0"
 shank = "0.4.2"
-serde = { version = "1", features = ["derive"] }
-bincode = "1"
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+# bincode for host/dev decoding of native stake wire; optional and only enabled with `std`.
+bincode = { version = "1", optional = true }
 
 [dev-dependencies]
 solana-program-test = "2.3.9"
@@ -27,25 +28,26 @@ solana-stake-program    = "3.0.2"
 solana-account         = "3.0.0"
 solana-sdk-ids         = "3.0.0"
 tokio = { version = "1.39", features = ["macros", "rt-multi-thread"] }
-bincode = "1"
 test-case = "3"
+bincode = "1"
 
 [features]
 # Build for the chain (SBF, no_std, real entrypoint, panic handler)
-sbf = ["bpf-entrypoint"]
+sbf = ["bpf-entrypoint", "wire_bincode"]
 
 # Controls the entrypoint module inclusion
 bpf-entrypoint = []
 no-entrypoint = []
 
-# Host builds use std; tests run here
-std = []
+# Host builds use std; tests run here. Enable bincode under std for decoding.
+std = ["bincode"]
 
 # Default host/dev: std + NO entrypoint (keeps IDE/cargo happy)
-default = ["std", "no-entrypoint"]
+default = ["std", "no-entrypoint", "wire_bincode"]
 e2e = []
 seed = []
 cu-trace = []
+wire_bincode = []
 
 [profile.dev]
 panic = "abort"
