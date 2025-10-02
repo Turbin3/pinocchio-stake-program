@@ -23,9 +23,6 @@ pub fn process_deactivate(accounts: &[AccountInfo]) -> ProgramResult {
     let stake_ai = next_account_info(it)?;
     let clock_ai = next_account_info(it)?;
 
-    if clock_ai.key() != &pinocchio::sysvars::clock::CLOCK_ID {
-        return Err(ProgramError::InvalidArgument);
-    }
     let clock = Clock::from_account_info(clock_ai)?;
 
     // 3) Load stake state (also checks program owner inside helper)

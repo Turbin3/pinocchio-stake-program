@@ -15,6 +15,15 @@ use crate::{
         stake_state_v2::StakeStateV2,
     },
 };
+fn get_custodian_from_state(stake_ai: &AccountInfo) -> Option<Pubkey> {
+    if let Ok(state) = get_stake_state(stake_ai) {
+        match state {
+            StakeStateV2::Initialized(meta) => Some(meta.lockup.custodian),
+            StakeStateV2::Stake(meta, _, _) => Some(meta.lockup.custodian),
+            _ => None,
+        }
+    } else { None }
+}
 
 /// Recreates `Pubkey::create_with_seed(base, seed, owner)` in Pinocchio:
 /// derived = sha256(base || seed || owner)
@@ -56,29 +65,34 @@ pub fn process_authorize_checked_with_seed(
     args: AuthorizeCheckedWithSeedData, // has: new_authorized, stake_authorize, authority_seed, authority_owner
 ) -> ProgramResult {
     let role = args.stake_authorize;
-    // Expected accounts: 4 (1 sysvar):
-    // stake, old_authority_base, clock, new_authority [, optional custodian, ...]
-    if accounts.len() < 4 {
+    // Expected minimum accounts: stake, old_authority_base
+    if accounts.len() < 2 {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
-
-    let [stake_ai, old_base_ai, clock_ai, new_auth_ai, rest @ ..] = accounts else {
-        return Err(ProgramError::InvalidAccountData);
-    };
+    let stake_ai = &accounts[0];
+    let old_base_ai = &accounts[1];
+    let rest = &accounts[2..];
 
     // Basic checks
     if *stake_ai.owner() != crate::ID || !stake_ai.is_writable() {
         return Err(ProgramError::IncorrectProgramId);
     }
-    if clock_ai.key() != &pinocchio::sysvars::clock::CLOCK_ID {
-        return Err(ProgramError::InvalidArgument);
-    }
-    // New authority must be a signer
-    if !new_auth_ai.is_signer() {
-        return Err(ProgramError::MissingRequiredSignature);
-    }
+    // Identify new authority signer among remaining accounts
+    let new_auth_ai = rest
+        .iter()
+        .find(|ai| ai.is_signer())
+        .ok_or(ProgramError::MissingRequiredSignature)?;
+
+    // Find clock sysvar anywhere in remaining accounts
+    let clock_ai = rest
+        .iter()
+        .find(|ai| ai.key() == &pinocchio::sysvars::clock::CLOCK_ID)
+        .ok_or(ProgramError::InvalidInstructionData)?;
+
     // Optional custodian is passed through; policy enforces lockup rules
-    let _maybe_lockup_authority: Option<&AccountInfo> = rest.first();
+    let _maybe_lockup_authority: Option<&AccountInfo> = rest
+        .iter()
+        .find(|ai| ai.key() == &get_custodian_from_state(stake_ai).unwrap_or(Pubkey::default()) && ai.is_signer());
 
     // Load sysvar clock (safe)
     let _clock = Clock::from_account_info(clock_ai)?;

@@ -18,21 +18,18 @@ use crate::state::{MergeKind, StakeFlags, StakeStateV2};
 
 pub fn process_move_stake(accounts: &[AccountInfo], lamports: u64) -> ProgramResult {
     pinocchio::msg!("mvstake:begin");
-    // Discover accounts by role without heap: two writable stake accounts and signer authority
-    let mut first: Option<&AccountInfo> = None;
-    let mut second: Option<&AccountInfo> = None;
-    let mut stake_authority_info: Option<&AccountInfo> = None;
-    for ai in accounts.iter() {
-        if ai.is_signer() && stake_authority_info.is_none() {
-            stake_authority_info = Some(ai);
-        }
-        if *ai.owner() == crate::ID && ai.is_writable() {
-            if first.is_none() { first = Some(ai); continue; }
-            if second.is_none() { second = Some(ai); continue; }
-        }
+    // Canonical order: [source_stake, destination_stake, staker]
+    if accounts.len() < 3 { return Err(ProgramError::NotEnoughAccountKeys); }
+    let [source_stake_account_info, destination_stake_account_info, stake_authority_info, ..] = accounts else {
+        return Err(ProgramError::InvalidAccountData);
+    };
+    if *source_stake_account_info.owner() != crate::ID
+        || *destination_stake_account_info.owner() != crate::ID
+        || !source_stake_account_info.is_writable()
+        || !destination_stake_account_info.is_writable()
+    {
+        return Err(ProgramError::InvalidAccountOwner);
     }
-    let source_stake_account_info = first.ok_or(ProgramError::NotEnoughAccountKeys)?;
-    let destination_stake_account_info = second.ok_or(ProgramError::NotEnoughAccountKeys)?;
     pinocchio::msg!("mvstake:accs");
     // Resolve expected staker from source stake meta and ensure signer present
     let src_state = get_stake_state(source_stake_account_info)?;
@@ -40,10 +37,9 @@ pub fn process_move_stake(accounts: &[AccountInfo], lamports: u64) -> ProgramRes
         StakeStateV2::Initialized(meta) | StakeStateV2::Stake(meta, _, _) => meta.authorized.staker,
         _ => return Err(ProgramError::InvalidAccountData),
     };
-    let stake_authority_info = accounts
-        .iter()
-        .find(|ai| ai.is_signer() && ai.key() == &expected_staker)
-        .ok_or(ProgramError::MissingRequiredSignature)?;
+    if !stake_authority_info.is_signer() || stake_authority_info.key() != &expected_staker {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
     pinocchio::msg!("mvstake:auth");
 
     // Verify signer status is provided by the runtime

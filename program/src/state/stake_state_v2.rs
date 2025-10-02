@@ -3,7 +3,7 @@ use crate::state::stake_flag::StakeFlags;
 use crate::state::state::Meta;
 
 use crate::ID;
-use pinocchio::{account_info::AccountInfo, program_error::ProgramError};
+use pinocchio::{account_info::{AccountInfo, RefMut as AiRefMut}, program_error::ProgramError};
 
 #[repr(C)]
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -125,32 +125,27 @@ impl StakeStateV2 {
         Ok(())
     }
     #[inline]
-    pub fn try_from_account_info_mut_raw(
-        account_info: &AccountInfo,
-    ) -> Result<&mut Self, ProgramError> {
+    pub fn try_from_account_info_mut_raw<'a>(
+        account_info: &'a AccountInfo,
+    ) -> Result<AiRefMut<'a, Self>, ProgramError> {
         let expected_size = Self::size_of();
-        let data = account_info.try_borrow_mut_data()?; //  returns RefMut<[u8]>
+        let data = account_info.try_borrow_mut_data()?; // keeps borrow alive
 
         if data.len() != expected_size {
             return Err(ProgramError::InvalidAccountData);
         }
 
-        let ptr = data.as_ptr() as usize;
-        if ptr % core::mem::align_of::<Self>() != 0 {
-            return Err(ProgramError::InvalidAccountData); // misaligned
-        }
-
-        let ptr = data.as_ptr() as *mut Self;
         // SAFETY:
-        // - `data` is mutable and of correct length
-        // - Alignment has been checked
-        // - Memory is assumed to contain a valid StakeStateV2
-        Ok(unsafe { &mut *ptr })
+        // - `data` is a live mutable borrow of the account's byte buffer
+        // - Length checked above; AccountInfo data is guaranteed to be suitably
+        //   aligned by the runtime, so no extra alignment check is necessary.
+        // - Caller ensures the buffer contains a valid StakeStateV2
+        Ok(AiRefMut::map(data, |bytes: &mut [u8]| unsafe { &mut *(bytes.as_ptr() as *mut Self) }))
     }
 
-    pub fn get_stake_state(
-        stake_account_info: &AccountInfo,
-    ) -> Result<&mut StakeStateV2, ProgramError> {
+    pub fn get_stake_state<'a>(
+        stake_account_info: &'a AccountInfo,
+    ) -> Result<AiRefMut<'a, StakeStateV2>, ProgramError> {
         if *stake_account_info.owner() != ID {
             return Err(ProgramError::InvalidAccountOwner);
         }

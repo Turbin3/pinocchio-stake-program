@@ -28,27 +28,35 @@ pub fn process_authorize(
 ) -> ProgramResult {
     if accounts.len() < 2 { return Err(ProgramError::NotEnoughAccountKeys); }
 
-    // Find stake (owned by this program and writable) and clock sysvar anywhere in the list
-    let mut stake_idx: Option<usize> = None;
-    let mut clock_idx: Option<usize> = None;
-    for (i, ai) in accounts.iter().enumerate() {
-        if stake_idx.is_none() && *ai.owner() == crate::ID && ai.is_writable() {
-            stake_idx = Some(i);
-        }
-        if clock_idx.is_none() && ai.key() == &pinocchio::sysvars::clock::CLOCK_ID {
-            clock_idx = Some(i);
-        }
-        if stake_idx.is_some() && clock_idx.is_some() { break; }
+    // Canonical order (SDK/native): [stake, authority, clock].
+    // Load and validate stake first so Uninitialized returns InvalidAccountData
+    let stake_ai = &accounts[0];
+    if *stake_ai.owner() != crate::ID || !stake_ai.is_writable() {
+        return Err(ProgramError::IncorrectProgramId);
     }
-    let stake_ai = accounts.get(stake_idx.ok_or(ProgramError::InvalidAccountData)?)
-        .ok_or(ProgramError::InvalidAccountData)?;
-    let clock_ai = accounts.get(clock_idx.ok_or(ProgramError::InvalidInstructionData)?)
-        .ok_or(ProgramError::InvalidInstructionData)?;
-    if *stake_ai.owner() != crate::ID || !stake_ai.is_writable() { return Err(ProgramError::IncorrectProgramId); }
-    let clock = unsafe { Clock::from_account_info_unchecked(clock_ai)? };
+
+    // Quick path: if stake account is Uninitialized (discriminant == 0), return InvalidAccountData
+    let data = unsafe { stake_ai.borrow_data_unchecked() };
+    if !data.is_empty() && data[0] == 0 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    // Load state for Initialized/Stake
+    let state = get_stake_state(stake_ai)?;
+
+    // Require clock in the remaining accounts only if state is not Uninitialized
+    let clock = match state {
+        StakeStateV2::Uninitialized => { return Err(ProgramError::InvalidAccountData); }
+        _ => {
+            // Find clock anywhere among remaining accounts to be tolerant to SDK ordering
+            let clock_ai = accounts
+                .iter()
+                .find(|ai| ai.key() == &pinocchio::sysvars::clock::CLOCK_ID)
+                .ok_or(ProgramError::InvalidInstructionData)?;
+            unsafe { Clock::from_account_info_unchecked(clock_ai)? }
+        }
+    };
 
     // Load state to identify the expected lockup custodian; pass it if present and signer
-    let state = get_stake_state(stake_ai)?;
     let custodian_pk = match &state {
         StakeStateV2::Initialized(meta) => meta.lockup.custodian,
         StakeStateV2::Stake(meta, _, _) => meta.lockup.custodian,

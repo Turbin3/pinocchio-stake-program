@@ -58,7 +58,6 @@ pub fn process_withdraw(accounts: &[AccountInfo], withdraw_lamports: u64) -> Pro
     // Fast path: Uninitialized source with source signer — no sysvars needed
     match get_stake_state(source_stake_account_info) {
         Ok(StakeStateV2::Uninitialized) => {
-            msg!("Withdraw: source=Uninitialized fast path");
             if !source_stake_account_info.is_signer() {
                 return Err(ProgramError::MissingRequiredSignature);
             }

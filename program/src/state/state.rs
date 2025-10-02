@@ -32,7 +32,10 @@ impl Meta {
         core::mem::size_of::<Meta>()
     }
 
-    pub fn get_account_info(account: &AccountInfo) -> Result<&Self, ProgramError> {
+    /// SAFETY: This function performs an unchecked shared borrow of account
+    /// data and casts it to `Meta`. Callers must ensure no active mutable
+    /// borrows exist and uphold aliasing guarantees while the reference lives.
+    pub unsafe fn get_account_info(account: &AccountInfo) -> Result<&Self, ProgramError> {
         if account.data_len() < core::mem::size_of::<Meta>() {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -42,10 +45,13 @@ impl Meta {
         if account.owner() != &crate::ID {
             return Err(ProgramError::IncorrectProgramId);
         }
-        Ok(unsafe { &*(account.borrow_data_unchecked().as_ptr() as *const Self) })
+        Ok(&*(account.borrow_data_unchecked().as_ptr() as *const Self))
     }
 
-    pub fn get_account_info_mut(account: &AccountInfo) -> Result<&mut Self, ProgramError> {
+    /// SAFETY: Performs an unchecked mutable borrow and returns a &mut to the
+    /// underlying `Meta`. The caller must ensure unique access and uphold
+    /// Rust's aliasing guarantees for the duration of the reference.
+    pub unsafe fn get_account_info_mut(account: &AccountInfo) -> Result<&mut Self, ProgramError> {
         if account.data_len() < core::mem::size_of::<Meta>() {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -55,7 +61,7 @@ impl Meta {
         if account.owner() != &crate::ID {
             return Err(ProgramError::IncorrectProgramId);
         }
-        Ok(unsafe { &mut *(account.borrow_data_unchecked().as_ptr() as *mut Self) })
+        Ok(&mut *(account.borrow_data_unchecked().as_ptr() as *mut Self))
     }
 }
 
@@ -81,17 +87,23 @@ impl Lockup {
         time_in_force || epoch_in_force
     }
 
-    pub fn get_account_info(account: &AccountInfo) -> Result<&Self, ProgramError> {
+    /// SAFETY: Performs an unchecked shared borrow and returns a reference to
+    /// the `Lockup` structure within account data. Caller must ensure no
+    /// conflicting mutable borrows exist for the borrowed region.
+    pub unsafe fn get_account_info(account: &AccountInfo) -> Result<&Self, ProgramError> {
         if account.data_len() < Self::size() {
             return Err(ProgramError::InvalidAccountData);
         }
         if account.owner() != &crate::ID {
             return Err(ProgramError::IncorrectProgramId);
         }
-        Ok(unsafe { &*(account.borrow_data_unchecked().as_ptr() as *const Self) })
+        Ok(&*(account.borrow_data_unchecked().as_ptr() as *const Self))
     }
 
-    pub fn get_account_info_mut(account: &AccountInfo) -> Result<&mut Self, ProgramError> {
+    /// SAFETY: Performs an unchecked mutable borrow and returns a &mut to the
+    /// `Lockup`. Caller must ensure exclusive access to the account data and
+    /// uphold aliasing guarantees.
+    pub unsafe fn get_account_info_mut(account: &AccountInfo) -> Result<&mut Self, ProgramError> {
         if account.data_len() < Self::size() {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -101,7 +113,7 @@ impl Lockup {
         if account.owner() != &crate::ID {
             return Err(ProgramError::IncorrectProgramId);
         }
-        Ok(unsafe { &mut *(account.borrow_mut_data_unchecked().as_ptr() as *mut Self) })
+        Ok(&mut *(account.borrow_mut_data_unchecked().as_ptr() as *mut Self))
     }
 
     /// Custodian signature bypasses lockup

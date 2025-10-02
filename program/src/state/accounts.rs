@@ -34,20 +34,26 @@ impl Authorized {
         self.withdrawer == *pubkey
     }
 
-    pub fn get_account_info(accounts: &AccountInfo) -> Result<&Self, ProgramError> {
+    /// SAFETY: This function performs an unchecked borrow of account data and
+    /// casts it to `Authorized`. The caller must ensure no mutable borrows of
+    /// the same account data are active and that aliasing rules are respected.
+    pub unsafe fn get_account_info(accounts: &AccountInfo) -> Result<&Self, ProgramError> {
         if accounts.data_len() < Self::size() {
             return Err(ProgramError::InvalidAccountData);
         }
 
-        Ok(unsafe { &*(accounts.borrow_data_unchecked().as_ptr() as *const Self) })
+        Ok(&*(accounts.borrow_data_unchecked().as_ptr() as *const Self))
     }
 
-    pub fn get_account_info_mut(accounts: &AccountInfo) -> Result<&mut Self, ProgramError> {
+    /// SAFETY: Performs an unchecked mutable borrow and returns a &mut to the
+    /// underlying data. The caller must ensure unique access and uphold Rust's
+    /// aliasing guarantees for the lifetime of the returned reference.
+    pub unsafe fn get_account_info_mut(accounts: &AccountInfo) -> Result<&mut Self, ProgramError> {
         if accounts.data_len() < Self::size() {
             return Err(ProgramError::InvalidAccountData);
         }
 
-        Ok(unsafe { &mut *(accounts.borrow_mut_data_unchecked().as_ptr() as *mut Self) })
+        Ok(&mut *(accounts.borrow_mut_data_unchecked().as_ptr() as *mut Self))
     }
 
     // verify required signature is present

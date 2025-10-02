@@ -22,35 +22,25 @@ use crate::helpers::constant::MINIMUM_DELINQUENT_EPOCHS_FOR_DEACTIVATION;
 
 pub fn process_deactivate_delinquent(accounts: &[AccountInfo]) -> ProgramResult {
     msg!("Instruction: DeactivateDelinquent");
-
-    // --- Discover accounts by role ---
+    // --- Canonical order: [stake, delinquent_vote, reference_vote] ---
+    if accounts.len() < 3 { return Err(ProgramError::NotEnoughAccountKeys); }
+    let [stake_ai, delinquent_vote_ai, reference_vote_ai, ..] = accounts else {
+        return Err(ProgramError::InvalidAccountData);
+    };
     let vote_pid = vote_program_id();
-    let mut stake_ai: Option<&AccountInfo> = None;
-    let mut delinquent_vote_ai: Option<&AccountInfo> = None;
-    let mut reference_vote_ai: Option<&AccountInfo> = None;
-    for ai in accounts.iter() {
-        if stake_ai.is_none() && *ai.owner() == crate::ID && ai.is_writable() {
-            stake_ai = Some(ai);
-            continue;
-        }
-        if vote_pid != Pubkey::default() && *ai.owner() == vote_pid {
-            if delinquent_vote_ai.is_none() { delinquent_vote_ai = Some(ai); continue; }
-            if reference_vote_ai.is_none() { reference_vote_ai = Some(ai); continue; }
-        }
+    if *stake_ai.owner() != crate::ID || !stake_ai.is_writable() {
+        return Err(ProgramError::InvalidAccountOwner);
     }
-    let stake_ai = stake_ai.ok_or(ProgramError::NotEnoughAccountKeys)?;
-    let delinquent_vote_ai = delinquent_vote_ai.ok_or(ProgramError::NotEnoughAccountKeys)?;
-    let reference_vote_ai = reference_vote_ai.ok_or(ProgramError::NotEnoughAccountKeys)?;
-
-    // --- Clock (use current epoch) ---
-    let clock = Clock::get()?;
-
-    // --- Optional owner check for vote accounts ---
     if vote_pid != Pubkey::default() {
         if *reference_vote_ai.owner() != vote_pid || *delinquent_vote_ai.owner() != vote_pid {
             return Err(ProgramError::IncorrectProgramId);
         }
     }
+
+    // --- Clock (use current epoch) ---
+    let clock = Clock::get()?;
+
+    // --- Owner checks done above ---
 
     // --- 1) Reference must have a vote in EACH of the last N epochs (strict consecutive) ---
     {

@@ -2,7 +2,7 @@ use pinocchio::{
     account_info::AccountInfo,
     program_error::ProgramError,
     pubkey::Pubkey,
-    sysvars::clock::Clock,
+    sysvars::{clock::Clock, Sysvar},
     ProgramResult,
 };
 
@@ -12,33 +12,23 @@ use crate::{
 };
 
 /// Authorize (checked) instruction
-/// Accounts (4 + optional custodian):
-///   0. [writable] Stake account (must be owned by stake program)
-///   1. [sysvar]   Clock
-///   2. []         Old stake/withdraw authority (presence only; no strict signer requirement here)
-///   3. [signer]   New stake/withdraw authority
-///   4. [optional signer] Custodian (needed only if lockup is in force)
+/// Accounts (3 + optional custodian + optional extras):
+///   0. [writable] Stake account (owned by stake program)
+///   1. [signer]   Old stake/withdraw authority
+///   2. [signer]   New stake/withdraw authority
+///   3. [optional signer] Custodian (if lockup in force)
+///   (Clock is obtained via sysvar syscall; no explicit clock account required.)
 pub fn process_authorize_checked(
     accounts: &[AccountInfo],
     authority_type: StakeAuthorize,
 ) -> ProgramResult {
     if accounts.len() < 3 { return Err(ProgramError::NotEnoughAccountKeys); }
 
-    // Identify stake and clock in any order
-    let mut stake_idx: Option<usize> = None;
-    let mut clock_idx: Option<usize> = None;
-    for (i, ai) in accounts.iter().enumerate() {
-        if stake_idx.is_none() && *ai.owner() == crate::ID && ai.is_writable() { stake_idx = Some(i); }
-        if clock_idx.is_none() && ai.key() == &pinocchio::sysvars::clock::CLOCK_ID { clock_idx = Some(i); }
-        if stake_idx.is_some() && clock_idx.is_some() { break; }
+    // Stake must be first; other accounts may be in varying order per SDK.
+    let stake_ai = &accounts[0];
+    if *stake_ai.owner() != crate::ID || !stake_ai.is_writable() {
+        return Err(ProgramError::IncorrectProgramId);
     }
-    let stake_ai = accounts.get(stake_idx.ok_or(ProgramError::InvalidAccountData)?)
-        .ok_or(ProgramError::InvalidAccountData)?;
-    let clock_ai = accounts.get(clock_idx.ok_or(ProgramError::InvalidInstructionData)?)
-        .ok_or(ProgramError::InvalidInstructionData)?;
-    if *stake_ai.owner() != crate::ID || !stake_ai.is_writable() { return Err(ProgramError::IncorrectProgramId); }
-    let clock = unsafe { Clock::from_account_info_unchecked(clock_ai)? };
-
     // Load current state to determine required old authority and expected custodian
     let state = get_stake_state(stake_ai)?;
     let (required_old, custodian_pk) = match &state {
@@ -47,25 +37,30 @@ pub fn process_authorize_checked(
         _ => return Err(ProgramError::InvalidAccountData),
     };
 
-    // Find old authority account and ensure it signed
-    let old_auth_ai = accounts
+    // Identify signers among the remaining accounts
+    let rest = &accounts[1..];
+    let old_auth_ai = rest
         .iter()
-        .find(|ai| ai.key() == &required_old)
+        .find(|ai| ai.is_signer() && ai.key() == &required_old)
         .ok_or(ProgramError::MissingRequiredSignature)?;
-    if !old_auth_ai.is_signer() { return Err(ProgramError::MissingRequiredSignature); }
-
-    // Find new authority account: must be a signer and not the old authority, not stake, not clock
-    let new_auth_ai = accounts
+    let new_auth_ai = rest
         .iter()
         .find(|ai| ai.is_signer()
             && ai.key() != &required_old
             && ai.key() != stake_ai.key()
             && ai.key() != &pinocchio::sysvars::clock::CLOCK_ID)
         .ok_or(ProgramError::MissingRequiredSignature)?;
+    // Fetch clock via sysvar call
+    let clock = Clock::get()?;
+
+    // Load current state to determine required old authority and expected custodian
+    // Old authority must match state; new must differ from old and stake
+    if old_auth_ai.key() != &required_old { return Err(ProgramError::InvalidInstructionData); }
+    if new_auth_ai.key() == old_auth_ai.key() || new_auth_ai.key() == stake_ai.key() { return Err(ProgramError::InvalidInstructionData); }
     let new_authorized = *new_auth_ai.key();
 
     // Optional custodian (policy enforces signature only when lockup in force)
-    let maybe_lockup_authority: Option<&AccountInfo> = accounts
+    let maybe_lockup_authority: Option<&AccountInfo> = rest
         .iter()
         .find(|ai| ai.key() == &custodian_pk && ai.is_signer());
 
