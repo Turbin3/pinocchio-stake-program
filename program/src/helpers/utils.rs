@@ -242,7 +242,6 @@ pub fn get_stake_state(stake_account_info: &AccountInfo) -> Result<StakeStateV2,
     if *stake_account_info.owner() != ID {
         return Err(ProgramError::InvalidAccountOwner);
     }
-
     let data = unsafe { stake_account_info.borrow_data_unchecked() };
     StakeStateV2::deserialize(&data)
 }

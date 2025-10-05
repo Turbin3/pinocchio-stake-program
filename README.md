@@ -1,24 +1,22 @@
 # Pinocchio Stake
 
-This is a Pinocchio build of Solana’s Stake program. It speaks the same wire format as the native Stake program and can be dropped into ProgramTest under the canonical Stake ID.
+Pinocchio build of Solana’s Stake program with native wire compatibility.
 
 ## What’s here
 
-- Same instruction set and data layout as Solana’s Stake program
-- Handlers split out under `program/src/instruction/*`
-- No-std on SBF, std on host; no heap in hot paths
-- ProgramTest coverage for the usual stake flows
+- Native instruction set and data layout
+- Host (std) + SBF (no_std)
 
 ## Build
 
-Host/dev build (default features):
+Host/dev build:
 
 ```
 cd program
 cargo build
 ```
 
-SBF build (used by ProgramTest):
+SBF build:
 
 ```
 cargo-build-sbf --no-default-features --features sbf --manifest-path program/Cargo.toml
@@ -27,34 +25,22 @@ ls program/target/deploy/pinocchio_stake.so
 
 ## Test
 
-Run everything:
+All tests:
 
 ```
 cd program
 cargo test --features e2e -- --nocapture
 ```
 
-Run a specific set:
+## ProgramTest (local)
 
-```
-cargo test --test program_test --features e2e program_test_split:: -- --nocapture
-```
-
-Helpful flags:
-
-```
-RUST_LOG=solana_runtime::message_processor=debug cargo test --features e2e -- --nocapture
-RUST_BACKTRACE=1 cargo test --features e2e -- --nocapture
-```
+- Build SBF: `cargo-build-sbf --no-default-features --features sbf --manifest-path program/Cargo.toml`
+- Pin bench: `make -C program pt-pin`
+- Native snapshot: `make -C program pt-native`
 ## Bench marking
 
-cargo test --test bench --features e2e -- --ignored --nocapture
+`make -C program bench-csv` then `make -C program bench-diff BASE=program/benchmarks/prev.csv`
 
 ## Notes
 
-- ProgramTest is set to prefer BPF and loads the built `.so` under the Stake program ID. Make sure `program/target/deploy/pinocchio_stake.so` exists before running tests.
-- Tests use the native stake instruction builders; no custom client code is required.
-
-## License
-
-See repository policy.
+- ProgramTest prefers BPF and loads `pinocchio_stake.so` under the Stake program ID.

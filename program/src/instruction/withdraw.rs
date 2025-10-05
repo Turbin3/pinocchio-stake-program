@@ -1,6 +1,5 @@
 use pinocchio::{
     account_info::AccountInfo,
-    msg,
     program_error::ProgramError,
     sysvars::clock::Clock,
     ProgramResult,
@@ -13,73 +12,49 @@ use crate::{
 
 };
 use pinocchio::pubkey::Pubkey;
+use pinocchio::sysvars::{rent::Rent, Sysvar};
 
 //
 
 pub fn process_withdraw(accounts: &[AccountInfo], withdraw_lamports: u64) -> ProgramResult {
-    #[cfg(feature = "cu-trace")] msg!("Withdraw: enter");
-    // Discover accounts by role (tolerant to order):
-    let mut source_stake_account_info: Option<&AccountInfo> = None;
-    let mut destination_info: Option<&AccountInfo> = None;
-    let mut clock_info: Option<&AccountInfo> = None;
+   
+    // [stake, destination, clock, stake_history, withdraw_authority, (optional custodian), ...]
+    if accounts.len() < 5 { return Err(ProgramError::NotEnoughAccountKeys); }
+    let [
+        source_stake_account_info,
+        destination_info,
+        clock_info,
+        stake_history_info,
+        withdraw_authority_info,
+        rest @ ..
+    ] = accounts else { return Err(ProgramError::NotEnoughAccountKeys) };
 
-    // Identify stake and destination
-    for ai in accounts.iter() {
-        if source_stake_account_info.is_none() && *ai.owner() == crate::ID && ai.is_writable() {
-            source_stake_account_info = Some(ai);
-            continue;
-        }
+    // Basic checks on key roles
+    if *source_stake_account_info.owner() != crate::ID || !source_stake_account_info.is_writable() {
+        return Err(ProgramError::InvalidAccountOwner);
     }
-    // Requires stake to be found to avoid picking it as destination
-    let stake_key = source_stake_account_info
-        .ok_or(ProgramError::InvalidAccountData)?
-        .key();
-
-    for ai in accounts.iter() {
-        if clock_info.is_none() && ai.key() == &pinocchio::sysvars::clock::CLOCK_ID {
-            clock_info = Some(ai);
-            continue;
-        }
-        // Destination: first writable non-stake and non-sysvar account
-        if destination_info.is_none()
-            && ai.is_writable()
-            && ai.key() != stake_key
-            && ai.key() != &pinocchio::sysvars::clock::CLOCK_ID
-            && ai.key() != &crate::state::stake_history::ID
-        {
-            destination_info = Some(ai);
-        }
+    if !destination_info.is_writable() {
+        return Err(ProgramError::InvalidInstructionData);
     }
-
-    let source_stake_account_info = source_stake_account_info.ok_or(ProgramError::InvalidAccountData)?;
-    let destination_info = destination_info.ok_or(ProgramError::InvalidInstructionData)?;
-    let clock_info = clock_info.ok_or(ProgramError::InvalidInstructionData)?;
-
-    // Fast path: Uninitialized source with source signer — no sysvars needed
-    match get_stake_state(source_stake_account_info) {
-        Ok(StakeStateV2::Uninitialized) => {
-            if !source_stake_account_info.is_signer() {
-                return Err(ProgramError::MissingRequiredSignature);
-            }
-            relocate_lamports(
-                source_stake_account_info,
-                destination_info,
-                withdraw_lamports,
-            )?;
-            return Ok(());
-        }
-        _ => {}
+    if clock_info.key() != &pinocchio::sysvars::clock::CLOCK_ID {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    // Require stake_history sysvar id (native expects the exact account)
+    if stake_history_info.key() != &crate::state::stake_history::ID {
+        return Err(ProgramError::InvalidInstructionData);
     }
 
     #[cfg(feature = "cu-trace")] msg!("Withdraw: load clock");
     let clock = &Clock::from_account_info(clock_info)?;
     let stake_history = &StakeHistorySysvar(clock.epoch);
 
-    // Collect all transaction signers and determine optional custodian by state
-    #[cfg(feature = "cu-trace")] msg!("Withdraw: gather signers");
-    let mut signers_vec = [Pubkey::default(); crate::helpers::MAXIMUM_SIGNERS];
-    let n_signers = crate::helpers::collect_signers(accounts, &mut signers_vec)?;
-    let signers_slice: &[Pubkey] = &signers_vec[..n_signers];
+    // Build restricted signer set: withdrawer MUST sign; custodian is only required if lockup is in force.
+    if !withdraw_authority_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    let mut restricted = [Pubkey::default(); 1];
+    restricted[0] = *withdraw_authority_info.key();
+    let signers_slice: &[Pubkey] = &restricted[..1];
 
     // Decide withdrawal constraints based on current stake state
     #[cfg(feature = "cu-trace")] msg!("Withdraw: read state");
@@ -91,20 +66,15 @@ pub fn process_withdraw(accounts: &[AccountInfo], withdraw_lamports: u64) -> Pro
                 .check(signers_slice, StakeAuthorize::Withdrawer)
                 .map_err(to_program_error)?;
 
-            // Convert little-endian fields to u64
+            // At or past deactivation epoch, use dynamic effective stake
             let deact_epoch = u64::from_le_bytes(stake.delegation.deactivation_epoch);
-            // During the deactivation epoch, stake is still fully effective for withdrawal rules
-            let staked: u64 = if deact_epoch != u64::MAX && clock.epoch == deact_epoch {
-                u64::from_le_bytes(stake.delegation.stake)
-            } else if deact_epoch != u64::MAX && clock.epoch > deact_epoch {
-                // After deactivation epoch, consult history to compute remaining effective
+            let staked: u64 = if deact_epoch != u64::MAX && clock.epoch >= deact_epoch {
                 stake.delegation.stake(
                     clock.epoch.to_le_bytes(),
                     stake_history,
                     crate::helpers::PERPETUAL_NEW_WARMUP_COOLDOWN_RATE_EPOCH,
                 )
             } else {
-                // Not deactivating
                 u64::from_le_bytes(stake.delegation.stake)
             };
 
@@ -123,19 +93,19 @@ pub fn process_withdraw(accounts: &[AccountInfo], withdraw_lamports: u64) -> Pro
             (meta.lockup, rent_reserve, false)
         }
         StakeStateV2::Uninitialized => {
-            // For Uninitialized, require the source account to be a signer
+            // Native fast-path: only the source stake account must sign
             if !source_stake_account_info.is_signer() {
                 return Err(ProgramError::MissingRequiredSignature);
             }
-            (Lockup::default(), 0u64, false)
+            // Enforce rent reserve for partial withdraws; full withdraw may close the account
+            let rent_reserve = Rent::get()?.minimum_balance(source_stake_account_info.data_len());
+            (Lockup::default(), rent_reserve, false)
         }
         _ => return Err(ProgramError::InvalidAccountData),
     };
 
-    // Lockup must be expired or bypassed by a custodian signer
-    #[cfg(feature = "cu-trace")] msg!("Withdraw: check lockup");
-    // Determine if a custodian signer is present among accounts
-    let custodian = accounts
+    // Lockup must be expired or bypassed by a custodian signer (scan trailing accounts for matching custodian)
+    let custodian = rest
         .iter()
         .find(|ai| ai.is_signer() && ai.key() == &lockup.custodian)
         .map(|ai| ai.key());

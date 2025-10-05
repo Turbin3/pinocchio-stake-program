@@ -13,21 +13,23 @@ use crate::state::merge_kind::MergeKind;
 /// 1. `[writable]` Destination stake account (owned by this program)
 /// 2. `[signer]`   Staker authority (must be the *staker* of the source)
 pub fn process_move_lamports(accounts: &[AccountInfo], lamports: u64) -> ProgramResult {
-    // Canonical SDK order: [source_stake, destination_stake, staker]
-    let [source_stake_ai, destination_stake_ai, _rest @ ..] = accounts else {
-        return Err(ProgramError::NotEnoughAccountKeys);
+    // Canonical SDK order: [source_stake, destination_stake, staker]; enforce exactly 3
+    if accounts.len() != 3 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let [source_stake_ai, destination_stake_ai, staker_authority_ai] = accounts else {
+        return Err(ProgramError::InvalidInstructionData);
     };
-    // Resolve the expected staker key from source meta and ensure that signer is present
+    // Resolve the expected staker key from source meta and ensure the 3rd account is that signer
     let src_state = crate::helpers::get_stake_state(source_stake_ai)?;
     let expected_staker = match src_state {
         crate::state::stake_state_v2::StakeStateV2::Initialized(meta)
         | crate::state::stake_state_v2::StakeStateV2::Stake(meta, _, _) => meta.authorized.staker,
         _ => return Err(ProgramError::InvalidAccountData),
     };
-    let staker_authority_ai = accounts
-        .iter()
-        .find(|ai| ai.is_signer() && ai.key() == &expected_staker)
-        .ok_or(ProgramError::MissingRequiredSignature)?;
+    if !staker_authority_ai.is_signer() || staker_authority_ai.key() != &expected_staker {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
 
     // Always perform checks via shared helper; reject transient shapes.
 
@@ -58,7 +60,7 @@ pub fn process_move_lamports(accounts: &[AccountInfo], lamports: u64) -> Program
 
     // (post-check logging removed; pre-check above handles transient)
 
-    // Additional authority check: the staker must authorize this movement
+    // Additional authority check (redundant with helper and above): staker must match
     if source_kind.meta().authorized.staker != *staker_authority_ai.key() {
         return Err(ProgramError::MissingRequiredSignature);
     }

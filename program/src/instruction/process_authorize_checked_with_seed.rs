@@ -1,35 +1,30 @@
+#![allow(clippy::result_large_err)]
+
 use pinocchio::{
     account_info::AccountInfo,
     program_error::ProgramError,
     pubkey::Pubkey,
-    sysvars::clock::Clock,
+    sysvars::{clock::Clock, Sysvar},
     ProgramResult,
 };
 
 use crate::{
-    helpers::{collect_signers, get_stake_state, set_stake_state, MAXIMUM_SIGNERS},
-    // Centralized policy checks: staker/withdrawer auth + lockup/custodian
-    helpers::authorize_update,
+    helpers::{authorize_update, get_stake_state, set_stake_state},
     state::{
         accounts::AuthorizeCheckedWithSeedData,
         stake_state_v2::StakeStateV2,
+        StakeAuthorize,
     },
 };
-fn get_custodian_from_state(stake_ai: &AccountInfo) -> Option<Pubkey> {
-    if let Ok(state) = get_stake_state(stake_ai) {
-        match state {
-            StakeStateV2::Initialized(meta) => Some(meta.lockup.custodian),
-            StakeStateV2::Stake(meta, _, _) => Some(meta.lockup.custodian),
-            _ => None,
-        }
-    } else { None }
-}
 
 /// Recreates `Pubkey::create_with_seed(base, seed, owner)` in Pinocchio:
 /// derived = sha256(base || seed || owner)
-#[allow(dead_code)]
-fn derive_with_seed_compat(base: &Pubkey, seed: &[u8], owner: &Pubkey) -> Result<Pubkey, ProgramError> {
-    // Enforce max seed length 32 bytes
+fn derive_with_seed_compat(
+    base: &Pubkey,
+    seed: &[u8],
+    owner: &Pubkey,
+) -> Result<Pubkey, ProgramError> {
+    // Enforce max seed length 32 bytes (native parity)
     if seed.len() > 32 {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -41,7 +36,7 @@ fn derive_with_seed_compat(base: &Pubkey, seed: &[u8], owner: &Pubkey) -> Result
     buf[off..off + 32].copy_from_slice(&base[..]);
     off += 32;
 
-    // seed
+    // seed (as provided; <= 32 bytes)
     buf[off..off + seed.len()].copy_from_slice(seed);
     off += seed.len();
 
@@ -52,7 +47,8 @@ fn derive_with_seed_compat(base: &Pubkey, seed: &[u8], owner: &Pubkey) -> Result
     // sha256(buf[..off]) -> 32 bytes
     let mut out = [0u8; 32];
     const SUCCESS: u64 = 0;
-    let rc = unsafe { pinocchio::syscalls::sol_sha256(buf.as_ptr(), off as u64, out.as_mut_ptr()) };
+    let rc =
+        unsafe { pinocchio::syscalls::sol_sha256(buf.as_ptr(), off as u64, out.as_mut_ptr()) };
     if rc != SUCCESS {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -60,116 +56,132 @@ fn derive_with_seed_compat(base: &Pubkey, seed: &[u8], owner: &Pubkey) -> Result
     Ok(out)
 }
 
+/// Authorize (checked, with seed)
+/// Accounts (order tolerant):
+///   0. [writable] Stake account (owned by stake program)
+///   [somewhere]   Clock sysvar
+///   [somewhere]   Base signer (seed base)
+///   [somewhere]   New authority signer (must sign)
+///   [... optional signer] Custodian (required if lockup in force)
 pub fn process_authorize_checked_with_seed(
     accounts: &[AccountInfo],
-    args: AuthorizeCheckedWithSeedData, // has: new_authorized, stake_authorize, authority_seed, authority_owner
+    args: AuthorizeCheckedWithSeedData,
 ) -> ProgramResult {
-    let role = args.stake_authorize;
-    // Expected minimum accounts: stake, old_authority_base
-    if accounts.len() < 2 {
+    if accounts.len() < 4 {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
+
     let stake_ai = &accounts[0];
-    let old_base_ai = &accounts[1];
-    let rest = &accounts[2..];
 
-    // Basic checks
-    if *stake_ai.owner() != crate::ID || !stake_ai.is_writable() {
-        return Err(ProgramError::IncorrectProgramId);
+    // Native-like error split
+    if *stake_ai.owner() != crate::ID {
+        return Err(ProgramError::InvalidAccountOwner);
     }
-    // Identify new authority signer among remaining accounts
-    let new_auth_ai = rest
-        .iter()
-        .find(|ai| ai.is_signer())
-        .ok_or(ProgramError::MissingRequiredSignature)?;
+    if !stake_ai.is_writable() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
 
-    // Find clock sysvar anywhere in remaining accounts
-    let clock_ai = rest
+    let rest = &accounts[1..];
+
+    // Find clock among the rest
+    let clock_pos = rest
         .iter()
-        .find(|ai| ai.key() == &pinocchio::sysvars::clock::CLOCK_ID)
+        .position(|ai| ai.key() == &pinocchio::sysvars::clock::CLOCK_ID)
         .ok_or(ProgramError::InvalidInstructionData)?;
+    let _clock_ai = &rest[clock_pos];
+    let clock = Clock::get()?; // validated by id above
 
-    // Optional custodian is passed through; policy enforces lockup rules
-    let _maybe_lockup_authority: Option<&AccountInfo> = rest
-        .iter()
-        .find(|ai| ai.key() == &get_custodian_from_state(stake_ai).unwrap_or(Pubkey::default()) && ai.is_signer());
+    // Load state and determine the expected current authority by role
+    let state = get_stake_state(stake_ai)?;
+    let (staker_pk, withdrawer_pk, custodian_pk) = match &state {
+        StakeStateV2::Initialized(meta) | StakeStateV2::Stake(meta, _, _) => (
+            meta.authorized.staker,
+            meta.authorized.withdrawer,
+            meta.lockup.custodian,
+        ),
+        _ => return Err(ProgramError::InvalidAccountData),
+    };
 
-    // Load sysvar clock (safe)
-    let _clock = Clock::from_account_info(clock_ai)?;
+    let role = args.stake_authorize;
 
-    // Gather existing transaction signers (base and new_authorized must sign)
-    let mut signers_buf = [Pubkey::default(); MAXIMUM_SIGNERS];
-    let mut n = collect_signers(accounts, &mut signers_buf)?;
-    // Determine presence in signer set via pubkey membership (more robust than is_signer checks here)
-    let base_pk = *old_base_ai.key();
-    let new_pk = *new_auth_ai.key();
-    let contains = |k: &Pubkey, arr: &[Pubkey]| arr.iter().any(|s| s == k);
-    let mut base_in_signers = contains(&base_pk, &signers_buf[..n]);
-    let new_in_signers = contains(&new_pk, &signers_buf[..n]);
-    // If base present, augment signer set with derived PDA and both current authorized keys
-    // small numeric prints to avoid huge logs
-    let _n_dbg = n as u64; let _b_dbg = if base_in_signers {1u64} else {0}; let _new_dbg = if new_in_signers {1u64} else {0};
-    let _ = (_n_dbg, _b_dbg, _new_dbg);
-    if base_in_signers {
-        // Skip deriving PDA to avoid syscall length quirks in tests; inject current meta keys instead
-        // Current authorized keys from state (both staker and withdrawer to satisfy policy permutations)
-        if let Ok(state) = get_stake_state(stake_ai) {
-            let (staker_key, withdrawer_key) = match state {
-                StakeStateV2::Initialized(meta) => (meta.authorized.staker, meta.authorized.withdrawer),
-                StakeStateV2::Stake(meta, _, _) => (meta.authorized.staker, meta.authorized.withdrawer),
-                _ => (Pubkey::default(), Pubkey::default()),
-            };
-            if staker_key != Pubkey::default() && n < MAXIMUM_SIGNERS {
-                signers_buf[n] = staker_key;
-                n += 1;
-            }
-            if withdrawer_key != Pubkey::default() && n < MAXIMUM_SIGNERS {
-                signers_buf[n] = withdrawer_key;
-                n += 1;
-            }
+    // Identify a *base signer* such that
+    //   derive_with_seed_compat(base, seed, owner) == required old authority (by role).
+    // (Allow withdrawer to rotate staker; withdrawer-only for withdrawer rotation.)
+    let old_allowed: &[Pubkey] = match role {
+        StakeAuthorize::Staker => &[staker_pk, withdrawer_pk],
+        StakeAuthorize::Withdrawer => &[withdrawer_pk],
+    };
+
+    let mut base_ai_opt: Option<&AccountInfo> = None;
+    let mut derived_old = Pubkey::default();
+
+    for (i, ai) in rest.iter().enumerate() {
+        if i == clock_pos {
+            continue;
         }
-        // Recompute presence after augmentation
-        base_in_signers = true;
+        if !ai.is_signer() {
+            continue;
+        }
+        let d = derive_with_seed_compat(ai.key(), args.authority_seed, &args.authority_owner)?;
+        if old_allowed.iter().any(|k| *k == d) {
+            base_ai_opt = Some(ai);
+            derived_old = d;
+            break;
+        }
     }
 
-    let _signers = &signers_buf[..n];
+    let base_ai = base_ai_opt.ok_or(ProgramError::MissingRequiredSignature)?;
 
-    // In checked variants, the new authority is the 4th account
-    let new_authorized: Pubkey = *new_auth_ai.key();
-    // Enforce both base and new authority present in signer set
-    if !base_in_signers || !new_in_signers {
-        return Err(ProgramError::MissingRequiredSignature);
+    // Optional custodian among trailing accounts (must sign if lockup in force)
+    let maybe_custodian = rest
+        .iter()
+        .find(|ai| ai.is_signer() && ai.key() == &custodian_pk);
+
+    // The checked-with-seed variant also requires the *new* authority to sign.
+    // Pick a signer that is not the base signer and not the custodian.
+    let new_ai = rest
+        .iter()
+        .enumerate()
+        .filter(|(i, ai)| *i != clock_pos && ai.is_signer())
+        .map(|(_, ai)| ai)
+        .find(|ai| ai.key() != base_ai.key() && Some(*ai.key()) != maybe_custodian.map(|c| *c.key()))
+        .ok_or(ProgramError::MissingRequiredSignature)?;
+    let new_authorized = *new_ai.key();
+
+    // For policy helper, we present the *derived* old authority and (optionally) the custodian
+    let mut signers = [Pubkey::default(); 2];
+    let mut n = 0usize;
+    signers[n] = derived_old;
+    n += 1;
+    if let Some(c) = maybe_custodian {
+        signers[n] = *c.key();
+        n += 1;
     }
+    let signers = &signers[..n];
 
-    // Update via centralized policy using signer set that includes the derived PDA
-    match get_stake_state(stake_ai)? {
+    match state {
         StakeStateV2::Initialized(mut meta) => {
-            // Use augmented signer set from earlier (base + meta-authorized keys)
-            let signers = &signers_buf[..n];
             authorize_update(
                 &mut meta,
                 new_authorized,
-                role,
+                role.clone(),
                 signers,
-                _maybe_lockup_authority,
-                &_clock,
+                maybe_custodian,
+                &clock,
             )?;
-            set_stake_state(stake_ai, &StakeStateV2::Initialized(meta))?;
+            set_stake_state(stake_ai, &StakeStateV2::Initialized(meta))
         }
         StakeStateV2::Stake(mut meta, stake, flags) => {
-            let signers = &signers_buf[..n];
             authorize_update(
                 &mut meta,
                 new_authorized,
                 role,
                 signers,
-                _maybe_lockup_authority,
-                &_clock,
+                maybe_custodian,
+                &clock,
             )?;
-            set_stake_state(stake_ai, &StakeStateV2::Stake(meta, stake, flags))?;
+            set_stake_state(stake_ai, &StakeStateV2::Stake(meta, stake, flags))
         }
-        _ => return Err(ProgramError::InvalidAccountData),
+        _ => Err(ProgramError::InvalidAccountData),
     }
-
-    Ok(())
 }

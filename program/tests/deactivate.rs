@@ -73,6 +73,16 @@ async fn deactivate_success_after_delegate() {
     let vote_acc = Keypair::new();
     create_dummy_vote_account(&mut ctx, &vote_acc).await;
 
+    // Fund stake with at least the minimum delegation before delegating
+    let min_del = common::get_minimum_delegation_lamports(&mut ctx).await;
+    let fund_tx = Transaction::new_signed_with_payer(
+        &[system_instruction::transfer(&ctx.payer.pubkey(), &stake.pubkey(), min_del)],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        ctx.last_blockhash,
+    );
+    ctx.banks_client.process_transaction(fund_tx).await.unwrap();
+
     // DelegateStake to transition to Stake state
     let del_ix = ixn::delegate_stake(&stake.pubkey(), &staker.pubkey(), &vote_acc.pubkey());
     let msg = Message::new(&[del_ix], Some(&ctx.payer.pubkey()));
@@ -135,9 +145,17 @@ async fn deactivate_missing_staker_signature_fails() {
     tx.try_sign(&[&ctx.payer, &withdrawer], ctx.last_blockhash).unwrap();
     ctx.banks_client.process_transaction(tx).await.unwrap();
 
-    // Create dummy vote and delegate (with staker signature)
+    // Create dummy vote and fund stake above minimum, then delegate (with staker signature)
     let vote_acc = Keypair::new();
     create_dummy_vote_account(&mut ctx, &vote_acc).await;
+    let min_del = common::get_minimum_delegation_lamports(&mut ctx).await;
+    let fund_tx = Transaction::new_signed_with_payer(
+        &[system_instruction::transfer(&ctx.payer.pubkey(), &stake.pubkey(), min_del)],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        ctx.last_blockhash,
+    );
+    ctx.banks_client.process_transaction(fund_tx).await.unwrap();
     let del_ix = ixn::delegate_stake(&stake.pubkey(), &staker.pubkey(), &vote_acc.pubkey());
     let msg = Message::new(&[del_ix], Some(&ctx.payer.pubkey()));
     let mut tx = Transaction::new_unsigned(msg);

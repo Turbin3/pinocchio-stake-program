@@ -177,8 +177,8 @@ async fn withdraw_stake_active_fails_partial() {
     tx.try_sign(&[&ctx.payer, &withdrawer], ctx.last_blockhash).unwrap();
     ctx.banks_client.process_transaction(tx).await.unwrap();
 
-    // Fund extra and delegate to dummy vote account
-    let extra: u64 = 2_000_000;
+    // Fund extra (at least minimum delegation) and delegate to dummy vote account
+    let extra: u64 = common::get_minimum_delegation_lamports(&mut ctx).await;
     let fund_tx = Transaction::new_signed_with_payer(
         &[system_instruction::transfer(&ctx.payer.pubkey(), &stake.pubkey(), extra)],
         Some(&ctx.payer.pubkey()),
@@ -246,8 +246,8 @@ async fn withdraw_stake_after_deactivate_full_succeeds() {
     tx.try_sign(&[&ctx.payer, &withdrawer], ctx.last_blockhash).unwrap();
     ctx.banks_client.process_transaction(tx).await.unwrap();
 
-    // Fund and delegate
-    let extra: u64 = 2_000_000;
+    // Fund and delegate with at least the minimum delegation
+    let extra: u64 = common::get_minimum_delegation_lamports(&mut ctx).await;
     let fund_tx = Transaction::new_signed_with_payer(
         &[system_instruction::transfer(&ctx.payer.pubkey(), &stake.pubkey(), extra)],
         Some(&ctx.payer.pubkey()),

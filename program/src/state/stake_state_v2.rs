@@ -16,12 +16,11 @@ pub enum StakeStateV2 {
 }
 
 impl StakeStateV2 {
-    pub const ACCOUNT_SIZE: usize = core::mem::size_of::<Self>();
+    // Native-compatible on-account size
+    pub const ACCOUNT_SIZE: usize = 200;
 
     /// The fixed number of bytes used to serialize each stake account
-    pub const fn size_of() -> usize {
-        Self::ACCOUNT_SIZE
-    }
+    pub const fn size_of() -> usize { Self::ACCOUNT_SIZE }
 
     pub fn deserialize(data: &[u8]) -> Result<Self, ProgramError> {
         if data.is_empty() {
@@ -124,33 +123,8 @@ impl StakeStateV2 {
 
         Ok(())
     }
-    #[inline]
-    pub fn try_from_account_info_mut_raw<'a>(
-        account_info: &'a AccountInfo,
-    ) -> Result<AiRefMut<'a, Self>, ProgramError> {
-        let expected_size = Self::size_of();
-        let data = account_info.try_borrow_mut_data()?; // keeps borrow alive
-
-        if data.len() != expected_size {
-            return Err(ProgramError::InvalidAccountData);
-        }
-
-        // SAFETY:
-        // - `data` is a live mutable borrow of the account's byte buffer
-        // - Length checked above; AccountInfo data is guaranteed to be suitably
-        //   aligned by the runtime, so no extra alignment check is necessary.
-        // - Caller ensures the buffer contains a valid StakeStateV2
-        Ok(AiRefMut::map(data, |bytes: &mut [u8]| unsafe { &mut *(bytes.as_ptr() as *mut Self) }))
-    }
-
-    pub fn get_stake_state<'a>(
-        stake_account_info: &'a AccountInfo,
-    ) -> Result<AiRefMut<'a, StakeStateV2>, ProgramError> {
-        if *stake_account_info.owner() != ID {
-            return Err(ProgramError::InvalidAccountOwner);
-        }
-        Self::try_from_account_info_mut_raw(stake_account_info)
-    }
+    // Avoid exposing raw &mut casting over account data at a fixed size. Use
+    // helpers::get_stake_state()/set_stake_state() for safe (de)serialization.
 }
 
 #[cfg(test)]
@@ -161,41 +135,16 @@ mod tests {
     use super::*;
     #[test]
     fn test_size_of() {
-        // log all the data size of the StakeStateV2
-        log!("StakeStateV2 size: {}", StakeStateV2::size_of());
-        log!("StakeStateV2 account size: {}", StakeStateV2::ACCOUNT_SIZE);
-        log!("Meta size: {}", Meta::size());
-        log!("Stake size: {}", core::mem::size_of::<Stake>());
-        log!("StakeFlags size: {}", core::mem::size_of::<StakeFlags>());
-        assert_eq!(
-            StakeStateV2::size_of(),
-            core::mem::size_of::<StakeStateV2>()
-        );
+        // Ensure reported on-account size matches native expectation
+        assert_eq!(StakeStateV2::size_of(), 200);
     }
 
-    // test Check alignment
     #[test]
-    fn test_alignment() {
-        use core::mem;
-
-        // Allocate a buffer with the correct size for StakeStateV2
-        const SIZE: usize = 208; //StakeStateV2::size_of();
-        let data = [0u8; SIZE];
-
-        // Get the raw pointer and check alignment
-        let ptr = data.as_ptr() as usize;
-        let alignment = mem::align_of::<StakeStateV2>();
-
-        // Log for debug info
-        // log!(" Alignment required: {}", alignment);
-        // log!(" Pointer address: {}", ptr);
-        // log!(" Pointer address % alignment: {}", ptr % alignment);
-
-        // Assert that the pointer is correctly aligned
-        assert_eq!(
-            ptr % alignment,
-            0,
-            "Memory is not properly aligned for StakeStateV2"
-        );
+    fn test_internal_layout_fits() {
+        let m = core::mem::size_of::<Meta>();
+        let s = core::mem::size_of::<Stake>();
+        let flags_offset = 1 + m + s;
+        log!("Meta size: {} Stake size: {} flags_off: {}", m, s, flags_offset);
+        assert!(flags_offset < StakeStateV2::ACCOUNT_SIZE);
     }
 }

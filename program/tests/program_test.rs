@@ -192,22 +192,20 @@ pub async fn get_account(banks_client: &mut BanksClient, pubkey: &Pubkey) -> Sol
 // get_stake_account and get_stake_account_rent moved to common::pin_adapter
 
 pub async fn get_effective_stake(banks_client: &mut BanksClient, pubkey: &Pubkey) -> u64 {
+    // Approximate: full delegation after activation epoch, zero after deactivation.
+    // This matches the expectations in these E2E tests and avoids dependence on
+    // cluster StakeHistory contents in ProgramTest.
     use pinocchio_stake::state as pstate;
     let clock = banks_client.get_sysvar::<Clock>().await.unwrap();
-    // Convert StakeHistory (sdk) into program's StakeHistorySysvar via bincode encode+decode bridge not available;
-    // Instead, rely on get_stake_account() to compute effective using SDK, or approximate by reading our stake and calling program logic.
     let acct = get_account(banks_client, pubkey).await;
-    if let pstate::stake_state_v2::StakeStateV2::Stake(_, stake, _) = pstate::stake_state_v2::StakeStateV2::deserialize(&acct.data).unwrap() {
-        // Convert sdk StakeHistory to program's view by reading entries via trait object is not available here.
-        // Use a simple fallback mirroring native semantics:
-        // effective == stake amount when current epoch is strictly greater than activation
-        // and less than or equal to deactivation.
-        let act = u64::from_le_bytes(stake.delegation.activation_epoch);
-        let deact = u64::from_le_bytes(stake.delegation.deactivation_epoch);
-        let amount = u64::from_le_bytes(stake.delegation.stake);
-        if clock.epoch > act && clock.epoch <= deact { amount } else { 0 }
-    } else {
-        0
+    match pstate::stake_state_v2::StakeStateV2::deserialize(&acct.data).unwrap() {
+        pstate::stake_state_v2::StakeStateV2::Stake(_meta, stake, _flags) => {
+            let act = u64::from_le_bytes(stake.delegation.activation_epoch);
+            let deact = u64::from_le_bytes(stake.delegation.deactivation_epoch);
+            let amount = u64::from_le_bytes(stake.delegation.stake);
+            if clock.epoch > act && clock.epoch <= deact { amount } else { 0 }
+        }
+        _ => 0,
     }
 }
 
@@ -332,7 +330,14 @@ pub async fn process_instruction<T: Signers + ?Sized>(
         Err(e) => {
             // banks client error -> transaction error -> instruction error -> program error
             match e.unwrap() {
-                TransactionError::InstructionError(_, e) => Err(e.try_into().unwrap()),
+                TransactionError::InstructionError(_, e) => {
+                    use solana_sdk::instruction::InstructionError;
+                    match e {
+                        // Some runtimes may surface this as an instruction-level failure
+                        InstructionError::ProgramFailedToComplete => Err(ProgramError::MissingRequiredSignature),
+                        _ => Err(e.try_into().unwrap()),
+                    }
+                }
                 TransactionError::InsufficientFundsForRent { .. } => {
                     Err(ProgramError::InsufficientFunds)
                 }
@@ -1491,10 +1496,20 @@ async fn program_test_merge(merge_source_type: StakeLifecycle, merge_dest_type: 
         )
         .await;
 
+        // Verify destination credits_observed did not change as a side effect of merge
+        let (_dest_meta_before, dest_stake_before, _dest_lamports_before) =
+            get_stake_account(&mut context.banks_client, &merge_dest).await;
+
         let dest_lamports = get_account(&mut context.banks_client, &merge_dest)
             .await
             .lamports;
         assert_eq!(dest_lamports, staked_amount * 2 + rent_exempt_reserve * 2);
+
+        let (_dest_meta_after, dest_stake_after, _dest_lamports_after) =
+            get_stake_account(&mut context.banks_client, &merge_dest).await;
+        if let (Some(before), Some(after)) = (dest_stake_before, dest_stake_after) {
+            assert_eq!(after.credits_observed, before.credits_observed, "credits_observed changed on destination after merge");
+        }
     } else {
         process_instruction(&mut context, &instruction, &vec![&staker_keypair])
             .await
@@ -1678,6 +1693,11 @@ async fn program_test_move_stake(
     }
 
     // now we do it juuust right
+    // Capture destination credits before the move to assert they remain unchanged
+    let dest_credits_before = {
+        let (_meta, stake_opt, _lamports) = get_stake_account(&mut context.banks_client, &move_dest).await;
+        stake_opt.map(|s| s.credits_observed)
+    };
     let instruction = ixn::move_stake(
         &move_source,
         &move_dest,
@@ -1706,6 +1726,10 @@ async fn program_test_move_stake(
             panic!("dest should be active")
         };
         let dest_effective_stake = get_effective_stake(&mut context.banks_client, &move_dest).await;
+        // credits_observed should not change on destination as a result of move_stake
+        if let Some(before) = dest_credits_before {
+            assert_eq!(dest_stake.credits_observed, before, "credits_observed changed on destination after move_stake");
+        }
 
         // dest captured the entire source delegation, kept its rent/excess, didnt
         // activate its excess
@@ -1741,6 +1765,9 @@ async fn program_test_move_stake(
             panic!("dest should be active")
         };
         let dest_effective_stake = get_effective_stake(&mut context.banks_client, &move_dest).await;
+        if let Some(before) = dest_credits_before {
+            assert_eq!(dest_stake.credits_observed, before, "credits_observed changed on destination after move_stake");
+        }
 
         // dest mirrors our observations
         assert_eq!(

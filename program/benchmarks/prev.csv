@@ -1,0 +1,11 @@
+name,pin,native
+initialize_checked,651,5089
+authorize_checked,1417,9148
+set_lockup_checked,1367,8505
+delegate,1005,12565
+deactivate,917,10643
+split,2270,16048
+withdraw,827,5644
+merge,2834,9274
+move_lamports,3668,8689
+get_minimum_delegation,429,676

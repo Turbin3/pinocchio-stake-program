@@ -1,9 +1,28 @@
 extern crate alloc;
+// Merge instruction (Pinocchio implementation)
+//
+// Parity notes:
+// - This implementation mirrors the native stake-program acceptance checks: distinct
+//   destination/source, program ownership, both writable, exact account size, required
+//   sysvars present, staker authorization, and metadata (authorities/lockups) compatibility.
+// - Classification uses `MergeKind::get_if_mergeable(..)` and supports the common shape pairs:
+//   IN+IN, IN+AE, AE+IN, AE+AE, FA+FA. On success, source is drained and uninitialized.
+// - StakeHistory caveat: we intentionally do not read the full stake_history contents. Instead
+//   we wrap the current epoch in `StakeHistorySysvar(clock.epoch)` and rely on classification
+//   fallbacks (e.g., clearly deactivated shapes → Inactive). This is faithful for mainstream
+//   cases, but may diverge from native at epoch boundaries where effective/partial activation
+//   or cooldown depend on the actual StakeHistory entries.
+//   If strict parity at boundaries is required, consider adding a feature flag that reads a
+//   minimal slice of the sysvar (e.g., `get_entry(current_epoch-1)`) to disambiguate partial
+//   activation/cooldown before classification.
+
 use crate::{
     error::{to_program_error, StakeError},
     helpers::{
         collect_signers,
         constant::MAXIMUM_SIGNERS,
+        checked_add,
+        bytes_to_u64,
         get_stake_state,
         relocate_lamports,
         set_stake_state,
@@ -22,24 +41,25 @@ use pinocchio::{
 
 pub fn process_merge(accounts: &[AccountInfo]) -> ProgramResult {
     pinocchio::msg!("merge:begin");
-    // Canonical SDK order: [destination, source, authority]
-    if accounts.len() < 2 { return Err(ProgramError::NotEnoughAccountKeys); }
-    let dst_ai = &accounts[0];
-    let src_ai = &accounts[1];
+    // Native order: [destination, source, clock, stake_history]
+    if accounts.len() < 4 { return Err(ProgramError::NotEnoughAccountKeys); }
+    let [dst_ai, src_ai, clock_ai, stake_history_ai, _rest @ ..] = accounts else {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    };
     if dst_ai.key() == src_ai.key() { return Err(ProgramError::InvalidArgument); }
     if *dst_ai.owner() != ID || *src_ai.owner() != ID { return Err(ProgramError::InvalidAccountOwner); }
     if !dst_ai.is_writable() || !src_ai.is_writable() { return Err(ProgramError::InvalidInstructionData); }
-    pinocchio::msg!("merge:accs_ok");
+    if clock_ai.key() != &pinocchio::sysvars::clock::CLOCK_ID { return Err(ProgramError::InvalidInstructionData); }
+    if stake_history_ai.key() != &crate::state::stake_history::ID { return Err(ProgramError::InvalidInstructionData); }
 
-    // Load clock sysvar from any position
-    let clock_ai = accounts
-        .iter()
-        .find(|ai| ai.key() == &pinocchio::sysvars::clock::CLOCK_ID)
-        .ok_or(ProgramError::InvalidInstructionData)?;
     let clock = Clock::from_account_info(clock_ai)?;
-    pinocchio::msg!("merge:clock");
-    // Use the epoch wrapper; contents of history account are not read here
+    // Use the epoch wrapper; contents of stake_history account are not read here
     let stake_history = StakeHistorySysvar(clock.epoch);
+
+    // Enforce exact data size parity with native handlers
+    if dst_ai.data_len() != StakeStateV2::size_of() || src_ai.data_len() != StakeStateV2::size_of() {
+        return Err(ProgramError::InvalidAccountData);
+    }
 
     // Collect signers
     let mut signer_buf = [Pubkey::default(); MAXIMUM_SIGNERS];
@@ -136,17 +156,75 @@ pub fn process_merge(accounts: &[AccountInfo]) -> ProgramResult {
     // Ensure metadata compatibility (authorities equal, lockups compatible)
     MergeKind::metas_can_merge(dst_kind.meta(), src_kind.meta(), &clock)?;
     pinocchio::msg!("merge:metas_ok");
+    pinocchio::msg!("merge:after_metas");
 
     // Fast-path already attempted using raw states above
 
-    // Perform merge
-    if let Some(merged_state) = dst_kind.merge(src_kind, &clock)? {
-        set_stake_state(dst_ai, &merged_state)?;
+    // Special-case: allow Activating source into Inactive destination (symmetry)
+    pinocchio::msg!("merge:check_inline");
+    if let (MergeKind::Inactive(dst_meta, dst_lamports, dst_flags),
+            MergeKind::ActivationEpoch(_, src_stake, src_flags)) = (dst_kind.clone(), src_kind.clone()) {
+        pinocchio::msg!("merge:inline IN+AE");
+        let new_stake = checked_add(bytes_to_u64(src_stake.delegation.stake), dst_lamports)?;
+        let mut stake_out = src_stake;
+        stake_out.delegation.stake = new_stake.to_le_bytes();
+        let merged_flags = dst_flags.union(src_flags);
+        set_stake_state(dst_ai, &StakeStateV2::Stake(dst_meta, stake_out, merged_flags))?;
+        set_stake_state(src_ai, &StakeStateV2::Uninitialized)?;
+        relocate_lamports(src_ai, dst_ai, src_ai.lamports())?;
+        return Ok(());
     }
 
-    // Deinitialize and drain source
-    set_stake_state(src_ai, &StakeStateV2::Uninitialized)?;
-    relocate_lamports(src_ai, dst_ai, src_ai.lamports())?;
-
-    Ok(())
+    // Perform merge inline for all supported shape pairs; otherwise error
+    match (dst_kind.clone(), src_kind.clone()) {
+        (MergeKind::Inactive(_, _, _), MergeKind::Inactive(_, _, _)) => {
+            // no state change on destination; just close and drain source below
+            set_stake_state(src_ai, &StakeStateV2::Uninitialized)?;
+            relocate_lamports(src_ai, dst_ai, src_ai.lamports())?;
+            return Ok(());
+        }
+        (MergeKind::Inactive(dst_meta, dst_lamports, dst_flags), MergeKind::ActivationEpoch(_, src_stake, src_flags)) => {
+            pinocchio::msg!("merge:inline IN+AE(fallback)");
+            let new_stake = checked_add(bytes_to_u64(src_stake.delegation.stake), dst_lamports)?;
+            let mut stake_out = src_stake;
+            stake_out.delegation.stake = new_stake.to_le_bytes();
+            let merged_flags = dst_flags.union(src_flags);
+            set_stake_state(dst_ai, &StakeStateV2::Stake(dst_meta, stake_out, merged_flags))?;
+            set_stake_state(src_ai, &StakeStateV2::Uninitialized)?;
+            relocate_lamports(src_ai, dst_ai, src_ai.lamports())?;
+            return Ok(());
+        }
+        (MergeKind::ActivationEpoch(meta, mut stake, dst_flags), MergeKind::Inactive(_, src_lamports, src_flags)) => {
+            pinocchio::msg!("merge:inline AE+IN");
+            let new_stake = checked_add(bytes_to_u64(stake.delegation.stake), src_lamports)?;
+            stake.delegation.stake = new_stake.to_le_bytes();
+            let merged_flags = dst_flags.union(src_flags);
+            set_stake_state(dst_ai, &StakeStateV2::Stake(meta, stake, merged_flags))?;
+            set_stake_state(src_ai, &StakeStateV2::Uninitialized)?;
+            relocate_lamports(src_ai, dst_ai, src_ai.lamports())?;
+            return Ok(());
+        }
+        (MergeKind::ActivationEpoch(dst_meta, mut dst_stake, dst_flags), MergeKind::ActivationEpoch(src_meta, src_stake, src_flags)) => {
+            pinocchio::msg!("merge:inline AE+AE");
+            let src_stake_lamports = checked_add(bytes_to_u64(src_meta.rent_exempt_reserve), bytes_to_u64(src_stake.delegation.stake))?;
+            crate::helpers::merge::merge_delegation_stake_and_credits_observed(&mut dst_stake, src_stake_lamports, bytes_to_u64(src_stake.credits_observed))?;
+            let merged_flags = dst_flags.union(src_flags);
+            set_stake_state(dst_ai, &StakeStateV2::Stake(dst_meta, dst_stake, merged_flags))?;
+            set_stake_state(src_ai, &StakeStateV2::Uninitialized)?;
+            relocate_lamports(src_ai, dst_ai, src_ai.lamports())?;
+            return Ok(());
+        }
+        (MergeKind::FullyActive(dst_meta, mut dst_stake), MergeKind::FullyActive(_, src_stake)) => {
+            pinocchio::msg!("merge:inline FA+FA");
+            crate::helpers::merge::merge_delegation_stake_and_credits_observed(&mut dst_stake, bytes_to_u64(src_stake.delegation.stake), bytes_to_u64(src_stake.credits_observed))?;
+            set_stake_state(dst_ai, &StakeStateV2::Stake(dst_meta, dst_stake, crate::state::stake_flag::StakeFlags::empty()))?;
+            set_stake_state(src_ai, &StakeStateV2::Uninitialized)?;
+            relocate_lamports(src_ai, dst_ai, src_ai.lamports())?;
+            return Ok(());
+        }
+        _ => {
+            pinocchio::msg!("merge:unsupported_shape");
+            return Err(to_program_error(StakeError::MergeMismatch));
+        }
+    }
 }

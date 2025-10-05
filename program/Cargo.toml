@@ -27,6 +27,8 @@ solana-config-interface = "2.0.0"
 solana-stake-program    = "3.0.2"
 solana-account         = "3.0.0"
 solana-sdk-ids         = "3.0.0"
+solana-pubkey          = "3.0.0"
+solana-instruction     = "3.0.0"
 tokio = { version = "1.39", features = ["macros", "rt-multi-thread"] }
 test-case = "3"
 bincode = "1"
@@ -44,10 +46,14 @@ std = ["bincode"]
 
 # Default host/dev: std + NO entrypoint (keeps IDE/cargo happy)
 default = ["std", "no-entrypoint", "wire_bincode"]
-e2e = []
+e2e = ["allow-uninitialized-split"]
 seed = []
 cu-trace = []
 wire_bincode = []
+compat_loose_decode = []
+enforce-stake-config = []
+strict-authz = []
+allow-uninitialized-split = []
 
 [profile.dev]
 panic = "abort"
@@ -63,4 +69,8 @@ required-features = ["e2e"]
 [[test]]
 name = "authorize_with_seed"
 path = "tests/authorize_with_seed.rs"
-required-features = ["seed"]
+required-features = ["seed", "strict-authz"]
+
+[[test]]
+name = "deactivate_delinquent"
+path = "tests/deactivate_delinquent.rs"

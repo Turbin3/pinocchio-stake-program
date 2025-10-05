@@ -94,8 +94,14 @@ impl MergeKind {
                     (0, 0, 0) => {
                         // History yielded zeros; decide based on epochs.
                         let deact_epoch = bytes_to_u64(stake.delegation.deactivation_epoch);
+                        let act_epoch   = bytes_to_u64(stake.delegation.activation_epoch);
                         if delegated > 0 && deact_epoch == u64::MAX {
-                            Ok(Self::FullyActive(*meta, *stake))
+                            if clock.epoch > act_epoch {
+                                Ok(Self::FullyActive(*meta, *stake))
+                            } else {
+                                // At or before activation epoch: treat as ActivationEpoch (transient)
+                                Ok(Self::ActivationEpoch(*meta, *stake, *flags))
+                            }
                         } else {
                             // Either no delegation, or delegation but fully deactivated in the past
                             Ok(Self::Inactive(*meta, stake_lamports, *flags))
@@ -190,13 +196,22 @@ impl MergeKind {
             // Inactive + Inactive: no change
             (Self::Inactive(_, _, _), Self::Inactive(_, _, _)) => None,
 
-            // Inactive + ActivationEpoch: no change (must be dst receiving)
-            (Self::Inactive(_, _, _), Self::ActivationEpoch(_, _, _)) => None,
+            // Inactive + ActivationEpoch: allow by moving all inactive lamports into the activating stake
+            // Resulting state uses the destination's Meta, the source's Stake, and unioned flags.
+            (Self::Inactive(dst_meta, dst_lamports, dst_flags),
+             Self::ActivationEpoch(_, mut src_stake, src_flags)) => {
+                pinocchio::msg!("mk:merge IN+AE");
+                let new_stake = checked_add(bytes_to_u64(src_stake.delegation.stake), dst_lamports)?;
+                src_stake.delegation.stake = new_stake.to_le_bytes();
+                let merged_flags = dst_flags.union(src_flags);
+                Some(StakeStateV2::Stake(dst_meta, src_stake, merged_flags))
+            }
 
             // ActivationEpoch + Inactive: add *all* source lamports (incl. rent) to stake
             (Self::ActivationEpoch(meta, mut stake, dst_flags),
              Self::Inactive(_, src_lamports, src_flags)) =>
             {
+                pinocchio::msg!("mk:merge AE+IN");
                 let new_stake =
                     checked_add(bytes_to_u64(stake.delegation.stake), src_lamports)?;
                 stake.delegation.stake = new_stake.to_le_bytes();
@@ -236,7 +251,10 @@ impl MergeKind {
             }
 
             // any other shape is invalid (native throws StakeError::MergeMismatch)
-            _ => return Err(to_program_error(StakeError::MergeMismatch)),
+            _ => {
+                pinocchio::msg!("mk:merge default -> mismatch");
+                return Err(to_program_error(StakeError::MergeMismatch));
+            }
         };
 
         Ok(merged)

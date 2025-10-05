@@ -24,13 +24,32 @@ pub fn redelegate(accounts: &[AccountInfo]) -> ProgramResult {
     let n = collect_signers(accounts, &mut signers_buf)?;
     let signers = &signers_buf[..n];
 
-    // Expected accounts: 5 (2 sysvars + stake config)
+    // Expected accounts: 4 or 5 (native shape) -> [stake, vote, clock, stake_history, (optional stake_config)]
     let account_info_iter = &mut accounts.iter();
     let stake_account_info = next_account_info(account_info_iter)?;
     let vote_account_info  = next_account_info(account_info_iter)?;
     let clock_info         = next_account_info(account_info_iter)?;
-    let _stake_history     = next_account_info(account_info_iter)?; // present but not read directly
-    let _stake_config      = next_account_info(account_info_iter)?; // present but not read directly
+    let stake_history_ai   = next_account_info(account_info_iter)?; // present but not read directly
+    let _maybe_stake_config_ai = account_info_iter.next(); // optional and not read directly
+
+    // Ownership/identity checks for native parity
+    if *stake_account_info.owner() != crate::ID || !stake_account_info.is_writable() {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+    if *vote_account_info.owner() != crate::state::vote_state::vote_program_id() {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if clock_info.key() != &pinocchio::sysvars::clock::CLOCK_ID {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if stake_history_ai.key() != &crate::state::stake_history::ID {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    // Optional: enforce stake_config identity behind a feature flag (not required for logic)
+    // #[cfg(feature = "enforce-stake-config")]
+    // if _stake_config_ai.key() != &crate::state::stake_config::ID {
+    //     return Err(ProgramError::InvalidInstructionData);
+    // }
 
     let clock = &Clock::from_account_info(clock_info)?;
     let stake_history = StakeHistorySysvar(clock.epoch);
@@ -47,6 +66,12 @@ pub fn redelegate(accounts: &[AccountInfo]) -> ProgramResult {
             // how much can be delegated (lamports - rent)
             let ValidatedDelegatedInfo { stake_amount } =
                 validate_delegated_amount(stake_account_info, &meta)?;
+
+            // Enforce minimum delegation at (re)delegate time (native parity)
+            let min = crate::helpers::get_minimum_delegation();
+            if stake_amount < min {
+                return Err(to_program_error(crate::error::StakeError::InsufficientDelegation));
+            }
 
             // create stake delegated to the vote account
             let stake = new_stake_with_credits(
@@ -69,6 +94,19 @@ pub fn redelegate(accounts: &[AccountInfo]) -> ProgramResult {
 
             let ValidatedDelegatedInfo { stake_amount } =
                 validate_delegated_amount(stake_account_info, &meta)?;
+
+            // Enforce minimum delegation on redelegation when inactive (native parity)
+            let min = crate::helpers::get_minimum_delegation();
+            if stake_amount < min {
+                return Err(to_program_error(crate::error::StakeError::InsufficientDelegation));
+            }
+
+            // Mirror explicit TooSoon pre-check: if deactivating and target vote differs, reject
+            let current_voter = stake.delegation.voter_pubkey;
+            let deact_epoch = crate::helpers::bytes_to_u64(stake.delegation.deactivation_epoch);
+            if deact_epoch != u64::MAX && current_voter != *vote_account_info.key() {
+                return Err(to_program_error(crate::error::StakeError::TooSoonToRedelegate));
+            }
 
             // Delegate helper enforces the active-stake rules & rescind-on-same-voter case.
             redelegate_stake_with_credits(

@@ -69,8 +69,8 @@ async fn delegate_stake_success_sets_state_and_amount() {
     tx.try_sign(&[&ctx.payer, &withdrawer], ctx.last_blockhash).unwrap();
     ctx.banks_client.process_transaction(tx).await.unwrap();
 
-    // Prefund above reserve to create positive stake amount
-    let extra: u64 = 2_000_000;
+    // Prefund above reserve with at least the minimum delegation
+    let extra: u64 = common::get_minimum_delegation_lamports(&mut ctx).await;
     let fund_tx = Transaction::new_signed_with_payer(
         &[system_instruction::transfer(
             &ctx.payer.pubkey(),

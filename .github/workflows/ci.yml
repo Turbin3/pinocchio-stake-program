@@ -1,0 +1,83 @@
+name: CI (fast)
+
+on:
+  push:
+    branches: [ main, develop, "**" ]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-fast-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-fast:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUSTFLAGS: "-D warnings"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            program
+
+      - name: Build (host)
+        working-directory: program
+        run: cargo build --locked
+
+      - name: wire_parity
+        working-directory: program
+        run: cargo test --locked --features e2e --test wire_parity -- --nocapture
+
+      - name: wire_negative
+        working-directory: program
+        run: cargo test --locked --features e2e --test wire_negative -- --nocapture
+
+      - name: return_data
+        working-directory: program
+        run: cargo test --locked --features e2e --test return_data -- --nocapture
+
+      - name: move_invariants
+        working-directory: program
+        run: cargo test --locked --features e2e --test move_invariants -- --nocapture
+
+      - name: set_lockup_checked_acceptance
+        working-directory: program
+        run: cargo test --locked --features e2e --test set_lockup_checked_acceptance -- --nocapture
+
+  heavy:
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Native parity snapshot (ignored by default)
+        working-directory: program
+        run: cargo test --locked --features e2e --test native_parity -- --ignored --nocapture
+
+      - name: CU bench (CSV)
+        working-directory: program
+        run: |
+          make bench-csv || true
+
+      - name: Upload benchmarks
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cu-benchmarks
+          path: program/benchmarks/current.csv

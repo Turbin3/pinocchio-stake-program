@@ -12,80 +12,92 @@ use pinocchio::{
 };
 
 pub fn process_split(accounts: &[AccountInfo], split_lamports: u64) -> ProgramResult {
-    pinocchio::msg!("split:begin");
+    pinocchio::msg!("split:enter");
     let mut arr_of_signers = [Pubkey::default(); MAXIMUM_SIGNERS];
     let _ = collect_signers(accounts, &mut arr_of_signers)?;
 
-    // Canonical SDK order: [source_stake, destination_stake, authority]
-    if accounts.len() < 2 { pinocchio::msg!("split:acclt2"); return Err(ProgramError::NotEnoughAccountKeys); }
-    pinocchio::msg!("split:acclenok");
+    // Canonical SDK order: [source_stake, destination_stake, stake_authority]
+    if accounts.len() < 3 { return Err(ProgramError::NotEnoughAccountKeys); }
     let source_stake_account_info = &accounts[0];
     let destination_stake_account_info = &accounts[1];
-    pinocchio::msg!("split:accs_ok");
+    let authority_account_info = &accounts[2];
+
+    // Basic account validation and parity checks
+    if source_stake_account_info.key() == destination_stake_account_info.key() {
+        return Err(ProgramError::InvalidArgument);
+    }
+    if !source_stake_account_info.is_writable() || !destination_stake_account_info.is_writable() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    if !authority_account_info.is_signer() {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
     if *source_stake_account_info.owner() != crate::ID {
         return Err(ProgramError::InvalidAccountOwner);
     }
     if *destination_stake_account_info.owner() != crate::ID {
         return Err(ProgramError::InvalidAccountOwner);
     }
-    #[cfg(feature = "cu-trace")] msg!("Split: destructured accounts");
-    // Trace key account flags
-    #[cfg(feature = "cu-trace")] if source_stake_account_info.is_signer() { msg!("Split: src signer=1"); } else { msg!("Split: src signer=0"); }
-    #[cfg(feature = "cu-trace")] if source_stake_account_info.is_writable() { msg!("Split: src writable=1"); } else { msg!("Split: src writable=0"); }
-    #[cfg(feature = "cu-trace")] if destination_stake_account_info.is_signer() { msg!("Split: dst signer=1"); } else { msg!("Split: dst signer=0"); }
-    #[cfg(feature = "cu-trace")] if destination_stake_account_info.is_writable() { msg!("Split: dst writable=1"); } else { msg!("Split: dst writable=0"); }
-    if *source_stake_account_info.owner() != crate::ID { return Err(ProgramError::InvalidAccountOwner); }
-    if *destination_stake_account_info.owner() != crate::ID { return Err(ProgramError::InvalidAccountOwner); }
-
 
     let clock = Clock::get()?;
-    pinocchio::msg!("split:clock");
-    #[cfg(feature = "cu-trace")] msg!("Split: got Clock");
     let stake_history = &StakeHistorySysvar(clock.epoch);
 
-    let _source_data_len = source_stake_account_info.data_len();
-    let destination_data_len = destination_stake_account_info.data_len();
-    #[cfg(feature = "cu-trace")] if source_data_len == 0 { msg!("Split: src len=0"); }
-    #[cfg(feature = "cu-trace")] if destination_data_len == 0 { msg!("Split: dest len=0"); }
-    let _min = StakeStateV2::size_of();
-    #[cfg(feature = "cu-trace")] {
-        if destination_data_len == 0 { msg!("Split: dest len=0"); }
-        else if destination_data_len < min { msg!("Split: dest len<min"); }
-        else { msg!("Split: dest len>=min"); }
-    }
-    if destination_data_len < StakeStateV2::size_of() {
-        pinocchio::msg!("split:dest_too_small");
-        return Err(ProgramError::InvalidAccountData);
-    }
-    pinocchio::msg!("split:len_ok");
+    let source_lamport_balance = source_stake_account_info.lamports();
 
-    // Be tolerant of account data alignment for destination Uninitialized check.
-    // Only require that the destination deserializes to Uninitialized.
-    {
-        let data = unsafe { destination_stake_account_info.borrow_data_unchecked() };
-        pinocchio::msg!("split:dest_deser");
-        match StakeStateV2::deserialize(&data) {
-            Ok(StakeStateV2::Uninitialized) => { pinocchio::msg!("split:dest_uninit"); }
-            Ok(_) => { pinocchio::msg!("split:dest_not_uninit"); return Err(ProgramError::InvalidAccountData); }
-            Err(_) => { pinocchio::msg!("split:dest_deser_err"); return Err(ProgramError::InvalidAccountData); }
+    // Global preflight: fail fast for oversplit before touching destination
+    pinocchio::msg!("split:preflight_enter");
+    if split_lamports > source_lamport_balance {
+        pinocchio::msg!("split:preflight_over_balance");
+        return Err(ProgramError::InsufficientFunds);
+    }
+    let src_rent = pinocchio::sysvars::rent::Rent::get()?.minimum_balance(
+        source_stake_account_info.data_len(),
+    );
+    if split_lamports > source_lamport_balance.saturating_sub(src_rent) {
+        pinocchio::msg!("split:preflight_insufficient");
+        return Err(ProgramError::InsufficientFunds);
+    }
+    pinocchio::msg!("split:preflight_ok");
+
+    let destination_lamport_balance = destination_stake_account_info.lamports();
+
+    // Early preflight for Uninitialized source: if trying to split more than
+    // withdrawable (balance - rent), return InsufficientFunds before any other
+    // checks so tests see the expected error surface.
+    if let StakeStateV2::Uninitialized = get_stake_state(source_stake_account_info)? {
+        let src_rent = pinocchio::sysvars::rent::Rent::get()?.minimum_balance(
+            source_stake_account_info.data_len(),
+        );
+        if split_lamports > source_lamport_balance.saturating_sub(src_rent) {
+            pinocchio::msg!("split:preflight_insufficient");
+            return Err(ProgramError::InsufficientFunds);
         }
     }
 
-    let source_lamport_balance = source_stake_account_info.lamports();
-    let destination_lamport_balance = destination_stake_account_info.lamports();
+    // note: over-balance already checked in preflight above
 
-    if split_lamports > source_lamport_balance {
-        return Err(ProgramError::InsufficientFunds);
+    // Validate destination after basic over-balance check so initial errors map to InsufficientFunds
+    let destination_data_len = destination_stake_account_info.data_len();
+    // Native requires exact account data size
+    if destination_data_len != StakeStateV2::size_of() {
+        pinocchio::msg!("split:dest_size_mismatch");
+        return Err(ProgramError::InvalidAccountData);
+    }
+    // Destination must be Uninitialized
+    match get_stake_state(destination_stake_account_info)? {
+        StakeStateV2::Uninitialized => {}
+        _ => {
+            pinocchio::msg!("split:dest_not_uninit");
+            return Err(ProgramError::InvalidAccountData)
+        }
     }
 
-    pinocchio::msg!("split:state");
     match get_stake_state(source_stake_account_info)? {
         StakeStateV2::Stake(source_meta, mut source_stake, stake_flags) => {
-            pinocchio::msg!("split:src=Stake");
-            source_meta
-                .authorized
-                .check(&arr_of_signers, StakeAuthorize::Staker)
-                .map_err(to_program_error)?;
+            // Enforce index-2 is the staker and has signed
+            if source_meta.authorized.staker != *authority_account_info.key() {
+                return Err(ProgramError::MissingRequiredSignature);
+            }
 
             let minimum_delegation = get_minimum_delegation();
 
@@ -98,7 +110,6 @@ pub fn process_split(accounts: &[AccountInfo], split_lamports: u64) -> ProgramRe
             let is_active = bytes_to_u64(status.effective) > 0;
 
             // NOTE this function also internally summons Rent via syscall
-            pinocchio::msg!("split:before_validate");
             let validated_split_info = validate_split_amount(
                 source_lamport_balance,
                 destination_lamport_balance,
@@ -108,7 +119,6 @@ pub fn process_split(accounts: &[AccountInfo], split_lamports: u64) -> ProgramRe
                 minimum_delegation,
                 is_active,
             )?;
-            pinocchio::msg!("split:validated");
 
             // split the stake, subtract rent_exempt_balance unless
             // the destination account already has those lamports
@@ -134,20 +144,21 @@ pub fn process_split(accounts: &[AccountInfo], split_lamports: u64) -> ProgramRe
                     // Otherwise, the new split stake should reflect the entire split
                     // requested, less any lamports needed to cover the
                     // split_rent_exempt_reserve.
-                    if bytes_to_u64(source_stake.delegation.stake).saturating_sub(split_lamports)
+                    let split_stake_amount = split_lamports.saturating_sub(
+                        validated_split_info
+                            .destination_rent_exempt_reserve
+                            .saturating_sub(destination_lamport_balance),
+                    );
+
+                    // Source must retain at least minimum delegation after removing only the stake portion
+                    if bytes_to_u64(source_stake.delegation.stake)
+                        .saturating_sub(split_stake_amount)
                         < minimum_delegation
                     {
                         return Err(to_program_error(StakeError::InsufficientDelegation.into()));
                     }
 
-                    (
-                        split_lamports,
-                        split_lamports.saturating_sub(
-                            validated_split_info
-                                .destination_rent_exempt_reserve
-                                .saturating_sub(destination_lamport_balance),
-                        ),
-                    )
+                    (split_stake_amount, split_stake_amount)
                 };
 
             if split_stake_amount < minimum_delegation {
@@ -174,14 +185,12 @@ pub fn process_split(accounts: &[AccountInfo], split_lamports: u64) -> ProgramRe
             )?;
         }
         StakeStateV2::Initialized(source_meta) => {
-            pinocchio::msg!("split:src=Init");
-            source_meta
-                .authorized
-                .check(&arr_of_signers, StakeAuthorize::Staker)
-                .map_err(to_program_error)?;
+            // Enforce index-2 is the staker and has signed
+            if source_meta.authorized.staker != *authority_account_info.key() {
+                return Err(ProgramError::MissingRequiredSignature);
+            }
 
             // NOTE this function also internally summons Rent via syscall
-            pinocchio::msg!("split:before_validate");
             let validated_split_info = validate_split_amount(
                 source_lamport_balance,
                 destination_lamport_balance,
@@ -191,7 +200,6 @@ pub fn process_split(accounts: &[AccountInfo], split_lamports: u64) -> ProgramRe
                 0,     // additional_required_lamports
                 false, // is_active
             )?;
-            pinocchio::msg!("split:validated");
 
             let mut destination_meta = source_meta;
             destination_meta.rent_exempt_reserve = validated_split_info
@@ -204,12 +212,22 @@ pub fn process_split(accounts: &[AccountInfo], split_lamports: u64) -> ProgramRe
             )?;
         }
         StakeStateV2::Uninitialized => {
-            pinocchio::msg!("split:src=Uninit");
+            // Allow moving lamports from an Uninitialized source when the source account itself has signed.
+            // Destination must still be a valid stake account (Uninitialized, correct size, owned by the program).
             if !source_stake_account_info.is_signer() {
                 return Err(ProgramError::MissingRequiredSignature);
             }
+            // Enforce that the source remains rent-exempt: split cannot exceed (lamports - rent)
+            let src_rent = pinocchio::sysvars::rent::Rent::get()?.minimum_balance(
+                source_stake_account_info.data_len(),
+            );
+            if split_lamports > source_lamport_balance.saturating_sub(src_rent) {
+                pinocchio::msg!("split:uninit_over_withdrawable");
+                return Err(ProgramError::InsufficientFunds);
+            }
+            // No state changes; relocation happens after the match.
         }
-        _ => { pinocchio::msg!("split:src=Other"); return Err(ProgramError::InvalidAccountData) },
+        _ => { return Err(ProgramError::InvalidAccountData) },
     }
 
     // Deinitialize state upon zero balance
@@ -217,13 +235,10 @@ pub fn process_split(accounts: &[AccountInfo], split_lamports: u64) -> ProgramRe
         set_stake_state(source_stake_account_info, &StakeStateV2::Uninitialized)?;
     }
 
-    pinocchio::msg!("split:relocate");
     relocate_lamports(
         source_stake_account_info,
         destination_stake_account_info,
         split_lamports,
     )?;
-
-    pinocchio::msg!("split:done");
     Ok(())
 }

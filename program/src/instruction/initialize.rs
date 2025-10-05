@@ -1,7 +1,7 @@
 use pinocchio::{
     account_info::AccountInfo,
     program_error::ProgramError,
-    sysvars::rent::Rent,
+    sysvars::{rent::Rent, Sysvar},
     ProgramResult,
 };
 
@@ -31,14 +31,14 @@ pub fn initialize(
         return Err(ProgramError::NotEnoughAccountKeys);
     };
 
-    cu("initialize: before rent");
+    pinocchio::msg!("init:before_rent");
     let rent = &Rent::from_account_info(rent_info)?;
-    cu("initialize: after rent");
+    pinocchio::msg!("init:after_rent");
 
     // `get_stake_state()` is called unconditionally, which checks owner
-        cu("initialize: before do_initialize");
+        pinocchio::msg!("init:before_do");
         do_initialize(stake_account_info, authorized, lockup, rent)?;
-        cu("initialize: after do_initialize");
+        pinocchio::msg!("init:after_do");
 
     Ok(())
 }
@@ -50,11 +50,15 @@ pub fn do_initialize(
     rent: &Rent,
 ) -> ProgramResult{
     cu("do_initialize: enter");
+    pinocchio::msg!("init:check_size");
     if stake_account_info.data_len() != StakeStateV2::size_of() {
+        pinocchio::msg!("init:bad_size");
         return Err(ProgramError::InvalidAccountData);
     }
 
-    if let StakeStateV2::Uninitialized = get_stake_state(stake_account_info)? {
+    let before = get_stake_state(stake_account_info)?;
+    match before {
+        StakeStateV2::Uninitialized => {
         cu("do_initialize: after state check");
         let rent_exempt_reserve = rent.minimum_balance(stake_account_info.data_len());
         cu("do_initialize: after rent calc");
@@ -72,7 +76,10 @@ pub fn do_initialize(
         } else {
             Err(ProgramError::InsufficientFunds)
         }
-    } else {
-        Err(ProgramError::InvalidAccountData)
+    }
+        _ => {
+            pinocchio::msg!("init:not_uninit");
+            Err(ProgramError::InvalidAccountData)
+        }
     }
 }

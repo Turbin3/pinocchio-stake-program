@@ -55,6 +55,9 @@ async fn setup_active_stake(
     tx.try_sign(&[&ctx.payer, withdrawer], ctx.last_blockhash).unwrap();
     ctx.banks_client.process_transaction(tx).await.unwrap();
 
+    // Ensure we fund with at least the minimum delegation so delegate succeeds
+    let minimum = crate::common::get_minimum_delegation_lamports(ctx).await;
+    let extra = core::cmp::max(extra, minimum);
     if extra > 0 {
         let fund_tx = Transaction::new_signed_with_payer(
             &[system_instruction::transfer(&ctx.payer.pubkey(), &kp.pubkey(), extra)],

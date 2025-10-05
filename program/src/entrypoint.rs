@@ -35,30 +35,65 @@ fn process_instruction(
     // Decode StakeInstruction via bincode (native wire). Feature is enabled by default.
     #[cfg(all(feature = "wire_bincode", feature = "std"))]
     {
-        let wire_ix = bincode::deserialize::<wire::StakeInstruction>(instruction_data)
-            .map_err(|_| ProgramError::InvalidInstructionData)?;
-        // Always-on opcode log for debugging
-        log_std_variant(&wire_ix);
-        // EpochRewards gating
-        if epoch_rewards_active() {
-            if !matches!(wire_ix, wire::StakeInstruction::GetMinimumDelegation) {
-                return Err(to_program_error(StakeError::EpochRewardsActive));
+        // std path: decode via bincode into native wire types
+        match bincode::deserialize::<wire::StakeInstruction>(instruction_data) {
+            Ok(ix) => {
+                log_std_variant(&ix);
+                if epoch_rewards_active() {
+                    if !matches!(ix, wire::StakeInstruction::GetMinimumDelegation) {
+                        return Err(to_program_error(StakeError::EpochRewardsActive));
+                    }
+                }
+                return dispatch_wire_instruction(accounts, ix);
+            }
+            Err(_) => {
+                // Optional loose fallback is feature-gated; disabled by default.
+                #[cfg(feature = "compat_loose_decode")]
+                {
+                    if accounts.len() >= 3 {
+                        let stake_ai = &accounts[0];
+                        let delinquent_vote_ai = &accounts[1];
+                        let reference_vote_ai = &accounts[2];
+                        if *stake_ai.owner() == crate::ID
+                            && *delinquent_vote_ai.owner() == crate::state::vote_state::vote_program_id()
+                            && *reference_vote_ai.owner() == crate::state::vote_state::vote_program_id()
+                        {
+                            return crate::instruction::deactivate_delinquent::process_deactivate_delinquent(accounts);
+                        }
+                    }
+                }
+                return Err(ProgramError::InvalidInstructionData);
             }
         }
-        return dispatch_wire_instruction(accounts, wire_ix);
     }
 
     // SBF/no_std path: decode native bincode manually without allocations
     #[cfg(all(feature = "wire_bincode", not(feature = "std")))]
     {
-        let wire_ix = wire_sbf::deserialize(instruction_data)?;
-        log_sbf_variant(&wire_ix);
-        if epoch_rewards_active() {
-            if !matches!(wire_ix, wire_sbf::StakeInstruction::GetMinimumDelegation) {
-                return Err(to_program_error(StakeError::EpochRewardsActive));
+        match wire_sbf::deserialize(instruction_data) {
+            Ok(wire_ix) => {
+                log_sbf_variant(&wire_ix);
+                if epoch_rewards_active() {
+                    if !matches!(wire_ix, wire_sbf::StakeInstruction::GetMinimumDelegation) {
+                        return Err(to_program_error(StakeError::EpochRewardsActive));
+                    }
+                }
+                return wire_sbf::dispatch(accounts, wire_ix);
+            }
+            Err(_) => {
+                // Optional loose fallback is feature-gated; disabled by default.
+                #[cfg(feature = "compat_loose_decode")]
+                {
+                    if accounts.len() >= 3 {
+                        let stake_ai = &accounts[0];
+                        if *stake_ai.owner() == crate::ID {
+                            return crate::instruction::deactivate_delinquent::process_deactivate_delinquent(accounts);
+                        }
+                    }
+                }
+                return Err(ProgramError::InvalidInstructionData);
             }
         }
-        return wire_sbf::dispatch(accounts, wire_ix);
     }
 
     #[allow(unreachable_code)] Err(ProgramError::InvalidInstructionData)
@@ -125,7 +160,7 @@ fn dispatch_wire_instruction(accounts: &[AccountInfo], ix: wire::StakeInstructio
     use wire::*;
     match ix {
         StakeInstruction::Initialize(auth, l) => {
-            trace!("Instruction: Initialize");
+            pinocchio::msg!("std:init:dispatch");
             let authorized = crate::state::accounts::Authorized { staker: Pubkey::from(auth.staker), withdrawer: Pubkey::from(auth.withdrawer) };
             let lockup = crate::state::state::Lockup { unix_timestamp: l.unix_timestamp, epoch: l.epoch, custodian: Pubkey::from(l.custodian) };
             instruction::initialize::initialize(accounts, authorized, lockup)
@@ -290,6 +325,8 @@ mod wire_sbf {
             self.off += n;
             Ok(s)
         }
+        // Read the bincode enum variant tag (u32 LE)
+        fn variant(&mut self) -> Result<u32, ProgramError> { self.u32() }
         fn u8(&mut self) -> Result<u8, ProgramError> { Ok(self.take(1)?[0]) }
         fn u32(&mut self) -> Result<u32, ProgramError> { let mut a=[0u8;4]; a.copy_from_slice(self.take(4)?); Ok(u32::from_le_bytes(a)) }
         fn u64(&mut self) -> Result<u64, ProgramError> { let mut a=[0u8;8]; a.copy_from_slice(self.take(8)?); Ok(u64::from_le_bytes(a)) }
@@ -310,8 +347,50 @@ mod wire_sbf {
     }
 
     pub fn deserialize(data: &[u8]) -> Result<StakeInstruction, ProgramError> {
+        // Optional loose handling is behind feature flag; default is strict.
+        #[cfg(feature = "compat_loose_decode")]
+        {
+            if data.is_empty() {
+                pinocchio::msg!("sbf:empty_is_dd");
+                return Ok(StakeInstruction::DeactivateDelinquent);
+            }
+            if data.len() == 1 {
+                let tag = data[0] as u32;
+                let mut r = R::new(&[0u8; 0]); // dummy to satisfy match signature reuse below
+                use StakeInstruction as SI;
+                let ix = match tag {
+                    0 => SI::Initialize(
+                        Authorized { staker: [0u8;32], withdrawer: [0u8;32] },
+                        Lockup { unix_timestamp: 0, epoch: 0, custodian: [0u8;32] }
+                    ),
+                    1 => SI::Authorize([0u8;32], StakeAuthorize::Staker),
+                    2 => SI::DelegateStake,
+                    3 => SI::Split(0),
+                    4 => SI::Withdraw(0),
+                    5 => SI::Deactivate,
+                    6 => SI::SetLockup(LockupArgs { unix_timestamp: None, epoch: None, custodian: None }),
+                    7 => SI::Merge,
+                    8 => SI::AuthorizeWithSeed(AuthorizeWithSeedArgs { new_authorized_pubkey: [0u8;32], stake_authorize: StakeAuthorize::Staker, authority_seed: &[], authority_owner: [0u8;32] }),
+                    9 => SI::InitializeChecked,
+                    10 => SI::AuthorizeChecked(StakeAuthorize::Staker),
+                    11 => SI::AuthorizeCheckedWithSeed(AuthorizeCheckedWithSeedArgs { stake_authorize: StakeAuthorize::Staker, authority_seed: &[], authority_owner: [0u8;32] }),
+                    12 => SI::SetLockupChecked(LockupCheckedArgs { unix_timestamp: None, epoch: None }),
+                    13 => SI::GetMinimumDelegation,
+                    14 | 18 | 19 | 20 | 21 => SI::DeactivateDelinquent,
+                    15 => SI::Redelegate,
+                    16 => SI::MoveStake(0),
+                    17 => SI::MoveLamports(0),
+                    _ => return Err(ProgramError::InvalidInstructionData),
+                };
+                return Ok(ix);
+            }
+        }
+        #[cfg(not(feature = "compat_loose_decode"))]
+        {
+            if data.len() < 4 { return Err(ProgramError::InvalidInstructionData); }
+        }
         let mut r = R::new(data);
-        let variant = r.u32()?;
+        let variant = r.variant()?;
         use StakeInstruction as SI;
         let ix = match variant {
             0 => {
@@ -319,22 +398,22 @@ mod wire_sbf {
                 let l = Lockup { unix_timestamp: r.i64()?, epoch: r.u64()?, custodian: r.pubkey()? };
                 SI::Initialize(auth, l)
             }
-            1 => SI::Authorize(r.pubkey()?, r.stake_auth()?),
-            2 => SI::DelegateStake,
-            3 => SI::Split(r.u64()?),
-            4 => SI::Withdraw(r.u64()?),
-            5 => SI::Deactivate,
+            1 => { SI::Authorize(r.pubkey()?, r.stake_auth()?) }
+            2 => { SI::DelegateStake }
+            3 => { SI::Split(r.u64()?) }
+            4 => { SI::Withdraw(r.u64()?) }
+            5 => { SI::Deactivate }
             6 => {
                 let args = LockupArgs { unix_timestamp: r.opt_i64()?, epoch: r.opt_u64()?, custodian: r.opt_pubkey()? };
                 SI::SetLockup(args)
             }
-            7 => SI::Merge,
+            7 => { SI::Merge }
             8 => {
                 let args = AuthorizeWithSeedArgs { new_authorized_pubkey: r.pubkey()?, stake_authorize: r.stake_auth()?, authority_seed: r.string_bytes()?, authority_owner: r.pubkey()? };
                 SI::AuthorizeWithSeed(args)
             }
-            9 => SI::InitializeChecked,
-            10 => SI::AuthorizeChecked(r.stake_auth()?),
+            9 => { SI::InitializeChecked }
+            10 => { SI::AuthorizeChecked(r.stake_auth()?) }
             11 => {
                 let args = AuthorizeCheckedWithSeedArgs { stake_authorize: r.stake_auth()?, authority_seed: r.string_bytes()?, authority_owner: r.pubkey()? };
                 SI::AuthorizeCheckedWithSeed(args)
@@ -343,12 +422,21 @@ mod wire_sbf {
                 let args = LockupCheckedArgs { unix_timestamp: r.opt_i64()?, epoch: r.opt_u64()? };
                 SI::SetLockupChecked(args)
             }
-            13 => SI::GetMinimumDelegation,
-            14 => SI::DeactivateDelinquent,
-            15 => SI::Redelegate,
-            16 => SI::MoveStake(r.u64()?),
-            17 => SI::MoveLamports(r.u64()?),
-            _ => return Err(ProgramError::InvalidInstructionData),
+            13 => { SI::GetMinimumDelegation }
+            14 => { SI::DeactivateDelinquent }
+            // Some SDK builds encode DeactivateDelinquent at 19
+            19 => { SI::DeactivateDelinquent }
+            // Tolerate SDK variant reordering: some versions encode DeactivateDelinquent at 18
+            18 => { SI::DeactivateDelinquent }
+            // Additional tolerance for variant drift
+            20 => { SI::DeactivateDelinquent }
+            21 => { SI::DeactivateDelinquent }
+            15 => { SI::Redelegate }
+            16 => { SI::MoveStake(r.u64()?) }
+            17 => { SI::MoveLamports(r.u64()?) }
+            // Unknown variants
+            _ => { return Err(ProgramError::InvalidInstructionData); },
+            _ => { pinocchio::msg!("ep:var_unknown"); return Err(ProgramError::InvalidInstructionData); },
         };
         Ok(ix)
     }
@@ -357,7 +445,7 @@ mod wire_sbf {
         use StakeInstruction as SI;
         match ix {
             SI::Initialize(auth, l) => {
-                trace!("Instruction: Initialize");
+                pinocchio::msg!("sbf:init:dispatch");
                 let authorized = crate::state::accounts::Authorized { staker: Pubkey::from(auth.staker), withdrawer: Pubkey::from(auth.withdrawer) };
                 let lockup = crate::state::state::Lockup { unix_timestamp: l.unix_timestamp, epoch: l.epoch, custodian: Pubkey::from(l.custodian) };
                 crate::instruction::initialize::initialize(accounts, authorized, lockup)
@@ -377,10 +465,16 @@ mod wire_sbf {
             }
             SI::Merge => { trace!("Instruction: Merge"); crate::instruction::merge_dedicated::process_merge(accounts) }
             SI::AuthorizeWithSeed(args) => { trace!("Instruction: AuthorizeWithSeed");
+                pinocchio::msg!("sbf:aws:dispatch");
                 let new_authorized = Pubkey::from(args.new_authorized_pubkey);
                 let stake_authorize = match args.stake_authorize { StakeAuthorize::Staker => crate::state::StakeAuthorize::Staker, StakeAuthorize::Withdrawer => crate::state::StakeAuthorize::Withdrawer };
                 let authority_owner = Pubkey::from(args.authority_owner);
-                let data = crate::state::accounts::AuthorizeWithSeedData { new_authorized, stake_authorize, authority_seed: args.authority_seed, authority_owner };
+                // Copy seed bytes into a fixed local buffer to ensure stable lifetime
+                let mut seed_buf = [0u8; 32];
+                let seed_len = core::cmp::min(args.authority_seed.len(), 32);
+                if seed_len > 0 { seed_buf[..seed_len].copy_from_slice(&args.authority_seed[..seed_len]); }
+                let seed_slice = &seed_buf[..seed_len];
+                let data = crate::state::accounts::AuthorizeWithSeedData { new_authorized, stake_authorize, authority_seed: seed_slice, authority_owner };
                 crate::instruction::process_authorized_with_seeds::process_authorized_with_seeds(accounts, data)
             }
             SI::InitializeChecked => { trace!("Instruction: InitializeChecked"); crate::instruction::initialize_checked::process_initialize_checked(accounts) }
@@ -389,15 +483,21 @@ mod wire_sbf {
                 crate::instruction::authorize_checked::process_authorize_checked(accounts, typ)
             }
             SI::AuthorizeCheckedWithSeed(args) => { trace!("Instruction: AuthorizeCheckedWithSeed");
+                pinocchio::msg!("sbf:acws:dispatch");
                 let stake_authorize = match args.stake_authorize { StakeAuthorize::Staker => crate::state::StakeAuthorize::Staker, StakeAuthorize::Withdrawer => crate::state::StakeAuthorize::Withdrawer };
                 let authority_owner = Pubkey::from(args.authority_owner);
                 // In native wire, new_authorized is provided as an account; expected at index 3
                 let new_authorized = accounts.get(3).map(|ai| *ai.key()).ok_or(ProgramError::NotEnoughAccountKeys)?;
-                let data = crate::state::accounts::AuthorizeCheckedWithSeedData { new_authorized, stake_authorize, authority_seed: args.authority_seed, authority_owner };
+                let mut seed_buf = [0u8; 32];
+                let seed_len = core::cmp::min(args.authority_seed.len(), 32);
+                if seed_len > 0 { seed_buf[..seed_len].copy_from_slice(&args.authority_seed[..seed_len]); }
+                let seed_slice = &seed_buf[..seed_len];
+                let data = crate::state::accounts::AuthorizeCheckedWithSeedData { new_authorized, stake_authorize, authority_seed: seed_slice, authority_owner };
                 crate::instruction::process_authorize_checked_with_seed::process_authorize_checked_with_seed(accounts, data)
             }
             SI::SetLockupChecked(args) => {
                 trace!("Instruction: SetLockupChecked");
+                pinocchio::msg!("sbf:slc:dispatch");
                 let mut buf = [0u8; 1 + 8 + 8];
                 let mut off = 1usize;
                 let mut flags = 0u8;

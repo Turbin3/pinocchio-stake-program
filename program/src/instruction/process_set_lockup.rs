@@ -13,14 +13,52 @@ use crate::{
     state::{accounts::SetLockupData, stake_state_v2::StakeStateV2, state::Meta},
 };
 
+#[inline]
+fn parse_set_lockup_bytes(data: &[u8]) -> Result<SetLockupData, ProgramError> {
+    if data.is_empty() { return Err(ProgramError::InvalidInstructionData); }
+    let flags = data[0];
+    // Only allow bits 0x01 (ts), 0x02 (epoch), 0x04 (custodian)
+    if flags & !0x07 != 0 { return Err(ProgramError::InvalidInstructionData); }
+    let mut off = 1usize;
+
+    let unix_timestamp = if (flags & 0x01) != 0 {
+        if off + 8 > data.len() { return Err(ProgramError::InvalidInstructionData); }
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&data[off..off + 8]);
+        off += 8;
+        Some(i64::from_le_bytes(buf))
+    } else { None };
+
+    let epoch = if (flags & 0x02) != 0 {
+        if off + 8 > data.len() { return Err(ProgramError::InvalidInstructionData); }
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&data[off..off + 8]);
+        off += 8;
+        Some(u64::from_le_bytes(buf))
+    } else { None };
+
+    let custodian = if (flags & 0x04) != 0 {
+        if off + 32 > data.len() { return Err(ProgramError::InvalidInstructionData); }
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(&data[off..off + 32]);
+        off += 32;
+        Some(pk)
+    } else { None };
+
+    // Reject trailing bytes to ensure unambiguous encoding
+    if off != data.len() { return Err(ProgramError::InvalidInstructionData); }
+
+    Ok(SetLockupData { unix_timestamp, epoch, custodian })
+}
+
 pub fn process_set_lockup(accounts: &[AccountInfo], instruction_data: &[u8]) -> ProgramResult {
     // Iterate accounts: first is stake; additional accounts may be supplied
     let account_info_iter = &mut accounts.iter();
     let stake_account_info = next_account_info(account_info_iter)?;
     // Additional accounts are considered for signer collection
 
-    // Parse payload into optional fields
-    let args = SetLockupData::instruction_data(instruction_data);
+    // Parse payload into optional fields (wire-safe flags+payloads)
+    let args = parse_set_lockup_bytes(instruction_data)?;
 
     // Read the clock sysvar directly (no clock account is required)
     let clock = Clock::get()?;

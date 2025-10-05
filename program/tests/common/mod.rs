@@ -62,6 +62,31 @@ pub async fn transfer(ctx: &mut ProgramTestContext, recipient: &Pubkey, amount: 
     ctx.banks_client.process_transaction(tx).await.unwrap();
 }
 
+// Query the active stake program for its minimum delegation requirement (lamports)
+pub async fn get_minimum_delegation_lamports(ctx: &mut ProgramTestContext) -> u64 {
+    use crate::common::pin_adapter as ixn;
+    let ix = ixn::get_minimum_delegation();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        ctx.last_blockhash,
+    );
+    let sim = ctx
+        .banks_client
+        .simulate_transaction(tx)
+        .await
+        .expect("simulate get_minimum_delegation");
+    if let Some(rd) = sim.simulation_details.and_then(|d| d.return_data) {
+        let mut buf = [0u8; 8];
+        let n = core::cmp::min(rd.data.len(), 8);
+        buf[..n].copy_from_slice(&rd.data[..n]);
+        let v = u64::from_le_bytes(buf);
+        return v.max(1);
+    }
+    1
+}
+
 // Native baseline: do not override the builtin Stake program
 pub fn program_test_native() -> ProgramTest {
     let mut pt = ProgramTest::default();

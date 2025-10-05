@@ -9,10 +9,9 @@ use pinocchio::{
 };
 
 use crate::{
-    helpers::{collect_signers, get_stake_state, set_stake_state, MAXIMUM_SIGNERS},
+    helpers::{get_stake_state, set_stake_state},
     state::{stake_state_v2::StakeStateV2, state::Meta},
 };
-
 
 pub struct LockupCheckedData {
     pub unix_timestamp: Option<i64>,
@@ -26,6 +25,9 @@ impl LockupCheckedData {
             return Err(ProgramError::InvalidInstructionData);
         }
         let flags = data[0];
+        if flags & !0x03 != 0 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
         let mut off = 1usize;
 
         let unix_timestamp = if (flags & 0x01) != 0 {
@@ -52,60 +54,83 @@ impl LockupCheckedData {
             None
         };
 
+        if off != data.len() {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
         Ok(Self { unix_timestamp, epoch })
     }
 }
-
 
 pub fn process_set_lockup_checked(
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
+    pinocchio::msg!("slc:enter");
     if accounts.is_empty() {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
-
-    // stake, [old_auth?], [new_lockup_auth?], ...
     let stake_ai = &accounts[0];
 
-    // Parse the payload
+    if *stake_ai.owner() != crate::ID {
+        return Err(ProgramError::InvalidAccountOwner);
+    }
+    if !stake_ai.is_writable() {
+        pinocchio::msg!("slc:not_writable");
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
     let checked = LockupCheckedData::parse(instruction_data)?;
+    pinocchio::msg!("slc:parsed");
+    let rest = &accounts[1..];
 
-    // Collect all signers
-    let mut signer_buf = [Pubkey::default(); MAXIMUM_SIGNERS];
-    let n = collect_signers(accounts, &mut signer_buf)?;
-    let signers = &signer_buf[..n];
-
-    // Optional new custodian comes from account #2 and must be a signer if present
-    let custodian_update: Option<Pubkey> = match accounts.get(2) {
-        Some(ai) if ai.is_signer() => Some(*ai.key()),
-        Some(_ai) => return Err(ProgramError::MissingRequiredSignature),
-        None => None, // no custodian change
-    };
-
-    // Use Clock::get() (no clock account is required)
     let clock = Clock::get()?;
 
-    // Owner check happens in get_stake_state()
-    match get_stake_state(stake_ai)? {
+    let state = get_stake_state(stake_ai)?;
+    let (withdrawer_pk, custodian_pk, in_force) = match &state {
+        StakeStateV2::Initialized(meta) | StakeStateV2::Stake(meta, _, _) => (
+            meta.authorized.withdrawer,
+            meta.lockup.custodian,
+            meta.lockup.is_in_force(&clock, None),
+        ),
+        _ => return Err(ProgramError::InvalidAccountData),
+    };
+
+    let required_pk = if in_force { custodian_pk } else { withdrawer_pk };
+    let authority_ai = rest
+        .iter()
+        .find(|ai| ai.is_signer() && ai.key() == &required_pk)
+        .ok_or(ProgramError::MissingRequiredSignature)?;
+
+    let maybe_new_custodian: Option<Pubkey> = if accounts.len() >= 3 {
+        let ai = &accounts[2];
+        if !ai.is_signer() {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+        Some(*ai.key())
+    } else {
+        None
+    };
+
+    match state {
         StakeStateV2::Initialized(mut meta) => {
-            apply_set_lockup_policy(
+            apply_set_lockup_policy_checked(
                 &mut meta,
                 checked.unix_timestamp,
                 checked.epoch,
-                custodian_update,
-                signers,
+                maybe_new_custodian.as_ref(),
+                authority_ai,
                 &clock,
             )?;
             set_stake_state(stake_ai, &StakeStateV2::Initialized(meta))?;
         }
         StakeStateV2::Stake(mut meta, stake, flags) => {
-            apply_set_lockup_policy(
+            apply_set_lockup_policy_checked(
                 &mut meta,
                 checked.unix_timestamp,
                 checked.epoch,
-                custodian_update,
-                signers,
+                maybe_new_custodian.as_ref(),
+                authority_ai,
                 &clock,
             )?;
             set_stake_state(stake_ai, &StakeStateV2::Stake(meta, stake, flags))?;
@@ -116,40 +141,35 @@ pub fn process_set_lockup_checked(
     Ok(())
 }
 
-
-fn apply_set_lockup_policy(
+fn apply_set_lockup_policy_checked(
     meta: &mut Meta,
     unix_ts: Option<i64>,
     epoch: Option<u64>,
-    custodian_update: Option<Pubkey>,
-    signers: &[Pubkey],
+    new_custodian: Option<&Pubkey>,
+    signer_ai: &AccountInfo,
     clock: &Clock,
 ) -> Result<(), ProgramError> {
-    let is_signed = |who: &Pubkey| signers.iter().any(|s| s == who);
-
-    // Gate by current lockup status
-    if meta.lockup.is_in_force(clock, None) {
-        // Lockup currently in force => custodian must sign
-        if !is_signed(&meta.lockup.custodian) {
-            return Err(ProgramError::MissingRequiredSignature);
-        }
+    let in_force = meta.lockup.is_in_force(clock, None);
+    let required = if in_force {
+        meta.lockup.custodian
     } else {
-        // Lockup not in force => withdrawer must sign
-        if !is_signed(&meta.authorized.withdrawer) {
-            return Err(ProgramError::MissingRequiredSignature);
-        }
+        meta.authorized.withdrawer
+    };
+
+    if !signer_ai.is_signer() || *signer_ai.key() != required {
+        return Err(ProgramError::MissingRequiredSignature);
     }
 
-    // Apply updates
     if let Some(ts) = unix_ts {
         meta.lockup.unix_timestamp = ts;
     }
     if let Some(ep) = epoch {
         meta.lockup.epoch = ep;
     }
-    if let Some(new_custodian) = custodian_update {
-        meta.lockup.custodian = new_custodian;
+    if !in_force {
+        if let Some(cust) = new_custodian {
+            meta.lockup.custodian = *cust;
+        }
     }
-
     Ok(())
 }

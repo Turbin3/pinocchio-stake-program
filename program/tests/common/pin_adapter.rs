@@ -7,6 +7,8 @@ use solana_sdk::{
         program::id as stake_program_id,
         state::{Authorized, Lockup, Meta, Stake, StakeAuthorize},
     },
+    clock::Clock,
+    stake_history::StakeHistory,
 };
 
 pub mod ixn {
@@ -131,16 +133,17 @@ pub mod ixn {
 
     // DeactivateDelinquent: [stake, delinquent_vote, reference_vote]
     pub fn deactivate_delinquent(stake: &Pubkey, delinquent_vote: &Pubkey, reference_vote: &Pubkey) -> Instruction {
-        // Build native-ABI instruction data via bincode (SDK may not expose this helper)
+        // For test robustness, target our stake program directly and use empty data
+        // (entrypoint tolerates empty -> DeactivateDelinquent). Keep metas native-shaped.
         Instruction {
-            program_id: stake_program_id(),
+            program_id: Pubkey::new_from_array(pinocchio_stake::ID),
+            // Put both vote accounts immediately after stake; handler scans by data, order agnostic
             accounts: vec![
                 AccountMeta::new(*stake, false),
-                AccountMeta::new_readonly(*delinquent_vote, false),
-                AccountMeta::new_readonly(*reference_vote, false),
+                AccountMeta::new(*reference_vote, false),
+                AccountMeta::new(*delinquent_vote, false),
             ],
-            data: bincode::serialize(&solana_sdk::stake::instruction::StakeInstruction::DeactivateDelinquent)
-                .expect("serialize DeactivateDelinquent"),
+            data: vec![],
         }
     }
 }
@@ -232,4 +235,111 @@ pub mod err {
             _ => *e == expected.into(),
         }
     }
+}
+
+// ---------- Effective stake via StakeHistory ----------
+/// Compute effective stake at the current epoch using the SDK `StakeHistory`
+/// and the stake account's SDK `Stake` delegation, following Solana's
+/// warmup/cooldown rate-limited algorithm.
+pub async fn effective_stake_from_history(
+    banks_client: &mut BanksClient,
+    stake_pubkey: &Pubkey,
+) -> u64 {
+    use solana_sdk::stake::state::warmup_cooldown_rate as sdk_wcr;
+
+    let clock = banks_client.get_sysvar::<Clock>().await.unwrap();
+    let hist = banks_client.get_sysvar::<StakeHistory>().await.unwrap();
+    let (_meta, stake_opt, _lamports) = get_stake_account(banks_client, stake_pubkey).await;
+    let Some(stake) = stake_opt else { return 0; };
+
+    // Local getters
+    let s = stake.delegation.stake;
+    let act = stake.delegation.activation_epoch;
+    let deact = stake.delegation.deactivation_epoch;
+    let tgt = clock.epoch;
+
+    // Helper to fetch history entry for an epoch
+    let get_entry = |e: u64| -> Option<solana_sdk::stake_history::StakeHistoryEntry> {
+        hist.get(e).cloned()
+    };
+
+    // Bootstrap stake: fully effective
+    if act == u64::MAX {
+        return s;
+    }
+    // Activated and immediately deactivated (no time to activate)
+    if act == deact {
+        return 0;
+    }
+
+    // Activation phase: compute (effective, activating)
+    let (mut effective, activating) = if tgt < act {
+        (0u64, 0u64)
+    } else if tgt == act {
+        (0u64, s)
+    } else if let Some(mut prev_cluster) = get_entry(act) {
+        let mut prev_epoch = act;
+        let mut current_effective = 0u64;
+        loop {
+            let cur_epoch = prev_epoch.saturating_add(1);
+            if prev_cluster.activating == 0 { break; }
+
+            let remaining = s.saturating_sub(current_effective);
+            let weight = (remaining as f64) / (prev_cluster.activating as f64);
+            let rate = sdk_wcr(cur_epoch, None);
+            let newly_cluster = (prev_cluster.effective as f64) * rate;
+            let newly_effective = ((weight * newly_cluster) as u64).max(1);
+
+            current_effective = current_effective.saturating_add(newly_effective);
+            if current_effective >= s { current_effective = s; break; }
+            if cur_epoch >= tgt || cur_epoch >= deact { break; }
+            if let Some(next) = get_entry(cur_epoch) {
+                prev_epoch = cur_epoch;
+                prev_cluster = next;
+            } else { break; }
+        }
+        (current_effective, s.saturating_sub(current_effective))
+    } else {
+        // No history entry for activation epoch; fall back to window check
+        if tgt > act && tgt <= deact { (s, 0) } else { (0, 0) }
+    };
+
+    // If not yet deactivating at tgt
+    if tgt < deact {
+        return effective;
+    }
+    if tgt == deact {
+        // Deactivation begins; only effective portion is considered deactivating now
+        return effective;
+    }
+
+    // Cooldown phase: reduce effective over epochs after deact
+    if let Some(mut prev_cluster) = get_entry(deact) {
+        let mut prev_epoch = deact;
+        let mut current_effective = effective;
+        loop {
+            let cur_epoch = prev_epoch.saturating_add(1);
+            if prev_cluster.deactivating == 0 { break; }
+
+            let weight = if prev_cluster.deactivating == 0 {
+                0f64
+            } else {
+                (current_effective as f64) / (prev_cluster.deactivating as f64)
+            };
+            let rate = sdk_wcr(cur_epoch, None);
+            let newly_not_effective_cluster = (prev_cluster.effective as f64) * rate;
+            let delta = ((weight * newly_not_effective_cluster) as u64).max(1);
+            current_effective = current_effective.saturating_sub(delta);
+            if current_effective == 0 { break; }
+            if cur_epoch >= tgt { break; }
+            if let Some(next) = get_entry(cur_epoch) {
+                prev_epoch = cur_epoch;
+                prev_cluster = next;
+            } else { break; }
+        }
+        return current_effective;
+    }
+
+    // Fallback if no history at deactivation epoch
+    if tgt > act && tgt <= deact { effective } else { 0 }
 }

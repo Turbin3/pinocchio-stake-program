@@ -21,10 +21,10 @@ pub fn process_delegate(accounts: &[AccountInfo]) -> ProgramResult {
     let signers_count = collect_signers(accounts, &mut signers_array)?;
     let signers = &signers_array[..signers_count];
 
-    // Canonical SDK/native order: [stake, vote, clock, (optional stake_history)]
-    if accounts.len() < 3 { return Err(ProgramError::NotEnoughAccountKeys); }
-    let [stake_account_info, vote_account_info, clock_info, rest @ ..] = accounts else {
-        return Err(ProgramError::InvalidAccountData);
+    // Canonical SDK/native order: [stake, vote, clock, stake_history, (optional stake_config)]
+    if accounts.len() < 4 { return Err(ProgramError::NotEnoughAccountKeys); }
+    let [stake_account_info, vote_account_info, clock_info, stake_history_ai, rest @ ..] = accounts else {
+        return Err(ProgramError::InvalidInstructionData);
     };
     // stake must be owned by this program and writable
     if *stake_account_info.owner() != crate::ID || !stake_account_info.is_writable() {
@@ -38,12 +38,14 @@ pub fn process_delegate(accounts: &[AccountInfo]) -> ProgramResult {
     if clock_info.key() != &pinocchio::sysvars::clock::CLOCK_ID {
         return Err(ProgramError::InvalidInstructionData);
     }
-    // Optional stake_history presence check (id only; not read)
-    if let Some(ai) = rest.first() {
-        if ai.key() != &crate::state::stake_history::ID {
-            return Err(ProgramError::InvalidInstructionData);
-        }
+    // Require StakeHistory as 4th account for native parity (we don't deserialize it here)
+    if stake_history_ai.key() != &crate::state::stake_history::ID {
+        return Err(ProgramError::InvalidInstructionData);
     }
+    // Optional 5th StakeConfig account accepted (shape parity), ignored if present
+    // if let Some(cfg) = rest.first() {
+    //     if cfg.key() != &crate::state::stake_config::ID { return Err(ProgramError::InvalidInstructionData); }
+    // }
 
     let clock = &Clock::from_account_info(clock_info)?;
     let stake_history = &StakeHistorySysvar(clock.epoch);
@@ -60,6 +62,12 @@ pub fn process_delegate(accounts: &[AccountInfo]) -> ProgramResult {
             // Amount delegated = lamports - rent_exempt_reserve
             let ValidatedDelegatedInfo { stake_amount } =
                 validate_delegated_amount(stake_account_info, &meta)?;
+
+            // Enforce minimum delegation at initial delegate time (native parity)
+            let min = crate::helpers::get_minimum_delegation();
+            if stake_amount < min {
+                return Err(to_program_error(crate::error::StakeError::InsufficientDelegation));
+            }
 
             // Create stake and store
             let stake = new_stake_with_credits(
@@ -82,6 +90,12 @@ pub fn process_delegate(accounts: &[AccountInfo]) -> ProgramResult {
 
             let ValidatedDelegatedInfo { stake_amount } =
                 validate_delegated_amount(stake_account_info, &meta)?;
+
+            // Enforce minimum delegation on redelegation as well for parity with native
+            let min = crate::helpers::get_minimum_delegation();
+            if stake_amount < min {
+                return Err(to_program_error(crate::error::StakeError::InsufficientDelegation));
+            }
 
             // If deactivation is scheduled and target vote differs, reject (TooSoon)
             // Pre-check: if deactivating, only allow redelegation to the same vote

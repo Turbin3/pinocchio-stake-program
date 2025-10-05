@@ -17,6 +17,7 @@ pub fn authorize_update(
         StakeAuthorize::Staker => {
             // Either staker OR withdrawer may change the staker
             if !(signed(&meta.authorized.staker) || signed(&meta.authorized.withdrawer)) {
+                pinocchio::msg!("auth_upd:staker:not_signed");
                 return Err(ProgramError::MissingRequiredSignature);
             }
             meta.authorized.staker = new_authorized;
@@ -24,6 +25,7 @@ pub fn authorize_update(
         StakeAuthorize::Withdrawer => {
             // Only withdrawer may change the withdrawer
             if !signed(&meta.authorized.withdrawer) {
+                pinocchio::msg!("auth_upd:withdrawer:not_signed");
                 return Err(ProgramError::MissingRequiredSignature);
             }
 
@@ -35,6 +37,7 @@ pub fn authorize_update(
                     .map(|a| a.is_signer() && a.key() == &meta.lockup.custodian)
                     .unwrap_or(false);
                 if !custodian_ok {
+                    pinocchio::msg!("auth_upd:withdrawer:lockup_no_custodian");
                     return Err(ProgramError::MissingRequiredSignature);
                 }
             }

@@ -18,10 +18,10 @@ use crate::state::{MergeKind, StakeFlags, StakeStateV2};
 
 pub fn process_move_stake(accounts: &[AccountInfo], lamports: u64) -> ProgramResult {
     pinocchio::msg!("mvstake:begin");
-    // Canonical order: [source_stake, destination_stake, staker]
-    if accounts.len() < 3 { return Err(ProgramError::NotEnoughAccountKeys); }
-    let [source_stake_account_info, destination_stake_account_info, stake_authority_info, ..] = accounts else {
-        return Err(ProgramError::InvalidAccountData);
+    // Canonical order: [source_stake, destination_stake, staker]; enforce exactly 3 for strict parity
+    if accounts.len() != 3 { return Err(ProgramError::InvalidInstructionData); }
+    let [source_stake_account_info, destination_stake_account_info, stake_authority_info] = accounts else {
+        return Err(ProgramError::InvalidInstructionData);
     };
     if *source_stake_account_info.owner() != crate::ID
         || *destination_stake_account_info.owner() != crate::ID
@@ -70,14 +70,7 @@ pub fn process_move_stake(accounts: &[AccountInfo], lamports: u64) -> ProgramRes
     )?;
     pinocchio::msg!("mvstake:classified");
 
-    // Additional explicit guard (post-signer-check): destination must not be deactivating
-    if let Ok(StakeStateV2::Stake(_, stake, _)) = get_stake_state(destination_stake_account_info) {
-        let deact = bytes_to_u64(stake.delegation.deactivation_epoch);
-        let clock = pinocchio::sysvars::clock::Clock::get()?;
-        if deact != u64::MAX && clock.epoch <= deact {
-            return Err(crate::error::to_program_error(crate::error::StakeError::MergeMismatch));
-        }
-    }
+    // Deactivating checks are handled inside shared_checks classification; no extra guard needed here.
 
     // Native safeguard: require exact account data size
     if source_stake_account_info.data_len() != StakeStateV2::size_of()
@@ -105,6 +98,16 @@ pub fn process_move_stake(accounts: &[AccountInfo], lamports: u64) -> ProgramRes
     }
 
     // destination must be fully active or fully inactive
+    // Capture existing flags for preservation
+    let src_flags = match &src_state {
+        StakeStateV2::Stake(_, _, f) => *f,
+        _ => StakeFlags::empty(),
+    };
+    let dest_existing_flags = match get_stake_state(destination_stake_account_info) {
+        Ok(StakeStateV2::Stake(_, _, f)) => f,
+        _ => StakeFlags::empty(),
+    };
+
     let destination_meta = match destination_kind {
         MergeKind::FullyActive(destination_meta, mut destination_stake) => {
             // active destination must share the same vote account
@@ -131,7 +134,7 @@ pub fn process_move_stake(accounts: &[AccountInfo], lamports: u64) -> ProgramRes
 
             set_stake_state(
                 destination_stake_account_info,
-                &StakeStateV2::Stake(destination_meta, destination_stake, StakeFlags::empty()),
+                &StakeStateV2::Stake(destination_meta, destination_stake, dest_existing_flags),
             )?;
 
             destination_meta
@@ -148,7 +151,7 @@ pub fn process_move_stake(accounts: &[AccountInfo], lamports: u64) -> ProgramRes
 
             set_stake_state(
                 destination_stake_account_info,
-                &StakeStateV2::Stake(destination_meta, destination_stake, StakeFlags::empty()),
+                &StakeStateV2::Stake(destination_meta, destination_stake, dest_existing_flags),
             )?;
 
             destination_meta
@@ -166,7 +169,7 @@ pub fn process_move_stake(accounts: &[AccountInfo], lamports: u64) -> ProgramRes
         source_stake.delegation.stake = source_final_stake.to_le_bytes();
         set_stake_state(
             source_stake_account_info,
-            &StakeStateV2::Stake(source_meta, source_stake, StakeFlags::empty()),
+            &StakeStateV2::Stake(source_meta, source_stake, src_flags),
         )?;
     }
 
