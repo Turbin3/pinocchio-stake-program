@@ -49,7 +49,7 @@ pub fn process_merge(accounts: &[AccountInfo]) -> ProgramResult {
     if dst_ai.key() == src_ai.key() { return Err(ProgramError::InvalidArgument); }
     if *dst_ai.owner() != ID || *src_ai.owner() != ID { return Err(ProgramError::InvalidAccountOwner); }
     if !dst_ai.is_writable() || !src_ai.is_writable() { return Err(ProgramError::InvalidInstructionData); }
-    if clock_ai.key() != &pinocchio::sysvars::clock::CLOCK_ID { return Err(ProgramError::InvalidInstructionData); }
+    // clock will be validated by Clock::from_account_info
     if stake_history_ai.key() != &crate::state::stake_history::ID { return Err(ProgramError::InvalidInstructionData); }
 
     let clock = Clock::from_account_info(clock_ai)?;

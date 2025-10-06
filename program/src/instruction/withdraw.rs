@@ -36,9 +36,7 @@ pub fn process_withdraw(accounts: &[AccountInfo], withdraw_lamports: u64) -> Pro
     if !destination_info.is_writable() {
         return Err(ProgramError::InvalidInstructionData);
     }
-    if clock_info.key() != &pinocchio::sysvars::clock::CLOCK_ID {
-        return Err(ProgramError::InvalidInstructionData);
-    }
+    // clock will be validated by Clock::from_account_info
     // Require stake_history sysvar id (native expects the exact account)
     if stake_history_info.key() != &crate::state::stake_history::ID {
         return Err(ProgramError::InvalidInstructionData);

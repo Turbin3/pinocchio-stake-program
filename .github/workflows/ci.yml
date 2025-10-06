@@ -43,17 +43,8 @@ jobs:
         working-directory: program
         run: cargo test --locked --features e2e --test wire_negative -- --nocapture
 
-      - name: return_data
-        working-directory: program
-        run: cargo test --locked --features e2e --test return_data -- --nocapture
-
-      - name: move_invariants
-        working-directory: program
-        run: cargo test --locked --features e2e --test move_invariants -- --nocapture
-
-      - name: set_lockup_checked_acceptance
-        working-directory: program
-        run: cargo test --locked --features e2e --test set_lockup_checked_acceptance -- --nocapture
+      # ProgramTest-dependent suites (return_data, move_invariants, acceptance)
+      # are excluded from fast CI to avoid SBF toolchain requirements.
 
   heavy:
     if: github.event_name == 'workflow_dispatch'

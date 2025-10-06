@@ -184,19 +184,29 @@ pub(crate) fn validate_split_amount(
 // }
 
 // returns a deserialized vote state from raw account data
-pub fn get_vote_state(vote_account_info: &AccountInfo) -> Result<VoteState, ProgramError> {
+/// SAFETY: `_unchecked` variant performs an unchecked borrow of account data
+/// and casts raw bytes. Caller must ensure no other mutable borrows are active
+/// and uphold aliasing rules during the call.
+pub unsafe fn get_vote_state_unchecked(vote_account_info: &AccountInfo) -> Result<VoteState, ProgramError> {
     // owner must be the vote program
     if *vote_account_info.owner() != crate::state::vote_state::vote_program_id() {
         return Err(ProgramError::IncorrectProgramId);
     }
     // enforce account is large enough
-    let data = unsafe { vote_account_info.borrow_data_unchecked() };
+    let data = vote_account_info.borrow_data_unchecked();
     if data.len() < core::mem::size_of::<VoteState>() {
         return Err(ProgramError::InvalidAccountData);
     }
 
-    let vote_state = unsafe { &*(data.as_ptr() as *const VoteState) };
+    let vote_state = &*(data.as_ptr() as *const VoteState);
     Ok(vote_state.clone())
+}
+
+/// Safe wrapper around `get_vote_state_unchecked`. Prefer the `_unchecked`
+/// form when you want explicit unsafe at call sites.
+pub fn get_vote_state(vote_account_info: &AccountInfo) -> Result<VoteState, ProgramError> {
+    // SAFETY: This wrapper does not leak references; it clones the VoteState.
+    unsafe { get_vote_state_unchecked(vote_account_info) }
 }
 
 // Lightweight helper to read the latest credits from a vote account without
@@ -238,22 +248,42 @@ fn parse_epoch_credits_triplets(buf: &[u8], n: usize) -> Option<u64> {
 }
 
 // load stake state from account
-pub fn get_stake_state(stake_account_info: &AccountInfo) -> Result<StakeStateV2, ProgramError> {
+/// SAFETY: `_unchecked` variant performs an unchecked borrow of account data.
+/// Caller must ensure no conflicting borrows are active while reading.
+pub unsafe fn get_stake_state_unchecked(stake_account_info: &AccountInfo) -> Result<StakeStateV2, ProgramError> {
     if *stake_account_info.owner() != ID {
         return Err(ProgramError::InvalidAccountOwner);
     }
-    let data = unsafe { stake_account_info.borrow_data_unchecked() };
+    let data = stake_account_info.borrow_data_unchecked();
     StakeStateV2::deserialize(&data)
 }
 
+/// Safe wrapper around `get_stake_state_unchecked`.
+pub fn get_stake_state(stake_account_info: &AccountInfo) -> Result<StakeStateV2, ProgramError> {
+    // SAFETY: Reads bytes and returns an owned StakeStateV2; no references escape.
+    unsafe { get_stake_state_unchecked(stake_account_info) }
+}
+
 // write stake state back into account
+/// SAFETY: `_unchecked` variant performs an unchecked mutable borrow of
+/// account data and writes into it. Caller must ensure exclusive access
+/// to the account data for the duration of the call.
+pub unsafe fn set_stake_state_unchecked(
+    stake_account_info: &AccountInfo,
+    stake_state: &StakeStateV2,
+) -> Result<(), ProgramError> {
+    let mut data = stake_account_info.borrow_mut_data_unchecked();
+    stake_state.serialize(&mut data)?;
+    Ok(())
+}
+
+/// Safe wrapper around `set_stake_state_unchecked`.
 pub fn set_stake_state(
     stake_account_info: &AccountInfo,
     stake_state: &StakeStateV2,
 ) -> Result<(), ProgramError> {
-    let mut data = unsafe { stake_account_info.borrow_mut_data_unchecked() };
-    stake_state.serialize(&mut data)?;
-    Ok(())
+    // SAFETY: Writes bytes only; no references are returned.
+    unsafe { set_stake_state_unchecked(stake_account_info, stake_state) }
 }
 
 // compute stake amount = lamports - rent exempt reserve

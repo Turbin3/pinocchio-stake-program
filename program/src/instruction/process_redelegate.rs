@@ -39,9 +39,7 @@ pub fn redelegate(accounts: &[AccountInfo]) -> ProgramResult {
     if *vote_account_info.owner() != crate::state::vote_state::vote_program_id() {
         return Err(ProgramError::IncorrectProgramId);
     }
-    if clock_info.key() != &pinocchio::sysvars::clock::CLOCK_ID {
-        return Err(ProgramError::InvalidInstructionData);
-    }
+    // clock will be validated by Clock::from_account_info
     if stake_history_ai.key() != &crate::state::stake_history::ID {
         return Err(ProgramError::InvalidInstructionData);
     }
