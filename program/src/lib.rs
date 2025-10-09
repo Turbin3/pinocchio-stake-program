@@ -11,6 +11,7 @@ pub mod error;
 pub mod helpers;
 pub mod instruction;
 pub mod state;
+pub mod crypto;
 
 pinocchio_pubkey::declare_id!("Stake11111111111111111111111111111111111111");
 

@@ -5,6 +5,7 @@ use pinocchio::{
     sysvars::{clock::Clock, Sysvar},
     ProgramResult,
 };
+extern crate alloc;
 
 use crate::{
     helpers::{authorize_update, get_stake_state, set_stake_state},
@@ -22,37 +23,25 @@ pub fn process_authorize_checked(
     accounts: &[AccountInfo],
     authority_type: StakeAuthorize,
 ) -> ProgramResult {
-    if accounts.len() < 4 {
-        return Err(ProgramError::NotEnoughAccountKeys);
-    }
+    if accounts.len() < 4 { return Err(ProgramError::NotEnoughAccountKeys); }
 
     let stake_ai = &accounts[0];
-    // Native-like error split
-    if *stake_ai.owner() != crate::ID {
-        return Err(ProgramError::InvalidAccountOwner);
-    }
-    if !stake_ai.is_writable() {
+    if *stake_ai.owner() != crate::ID { return Err(ProgramError::InvalidAccountOwner); }
+    if !stake_ai.is_writable() { return Err(ProgramError::InvalidInstructionData); }
+
+    let rest = &accounts[1..];
+    // Require that a Clock sysvar meta is present (native wire expectation),
+    // while still reading via sysvar for Pinocchio safety.
+    let has_clock_meta = rest.iter().any(|ai| ai.key() == &pinocchio::sysvars::clock::CLOCK_ID);
+    if !has_clock_meta {
         return Err(ProgramError::InvalidInstructionData);
     }
-
-    // Locate clock in remaining accounts (order tolerant)
-    let rest = &accounts[1..];
-    let clock_pos = rest
-        .iter()
-        .position(|ai| ai.key() == &pinocchio::sysvars::clock::CLOCK_ID)
-        .ok_or(ProgramError::InvalidInstructionData)?;
-    let _clock_ai = &rest[clock_pos]; // presence validated by id
     let clock = Clock::get()?;
 
-    // Load state and resolve current authorities and custodian
+    // Load state
     let state = get_stake_state(stake_ai)?;
     let (staker_pk, withdrawer_pk, custodian_pk) = match &state {
-        StakeStateV2::Initialized(meta) => (
-            meta.authorized.staker,
-            meta.authorized.withdrawer,
-            meta.lockup.custodian,
-        ),
-        StakeStateV2::Stake(meta, _, _) => (
+        StakeStateV2::Initialized(meta) | StakeStateV2::Stake(meta, _, _) => (
             meta.authorized.staker,
             meta.authorized.withdrawer,
             meta.lockup.custodian,
@@ -60,70 +49,56 @@ pub fn process_authorize_checked(
         _ => return Err(ProgramError::InvalidAccountData),
     };
 
-    // Identify old-authority signer and new-authority signer (order tolerant)
-    let mut old_ai_opt: Option<&AccountInfo> = None;
-    let mut new_ai_opt: Option<&AccountInfo> = None;
-
-    for (i, ai) in rest.iter().enumerate() {
-        if i == clock_pos {
-            continue;
-        }
-        if !ai.is_signer() {
-            continue;
-        }
-
-        // Old authority allowed set per native rules:
-        // - Staker role: old may be staker OR withdrawer
-        // - Withdrawer role: old must be withdrawer
-        let k = ai.key();
-        let is_valid_old = match authority_type {
-            StakeAuthorize::Staker => k == &staker_pk || k == &withdrawer_pk,
-            StakeAuthorize::Withdrawer => k == &withdrawer_pk,
-        };
-
-        if is_valid_old && old_ai_opt.is_none() {
-            old_ai_opt = Some(ai);
-            continue;
-        }
-
-        // New authority must be a signer and may not be the (optional) custodian
-        if new_ai_opt.is_none() && ai.key() != &custodian_pk {
-            new_ai_opt = Some(ai);
-            continue;
-        }
-
-        if old_ai_opt.is_some() && new_ai_opt.is_some() {
-            break;
-        }
+    // Identify old authority by key + signer
+    let old_is_allowed = |k: &Pubkey| match authority_type {
+        StakeAuthorize::Staker => *k == staker_pk || *k == withdrawer_pk,
+        StakeAuthorize::Withdrawer => *k == withdrawer_pk,
+    };
+    match authority_type {
+        StakeAuthorize::Staker => pinocchio::msg!("ac:role=staker"),
+        StakeAuthorize::Withdrawer => pinocchio::msg!("ac:role=withdrawer"),
     }
+    let old_ai = match rest.iter().find(|ai| ai.is_signer() && old_is_allowed(ai.key())) {
+        Some(ai) => { pinocchio::msg!("ac:old=1"); ai }
+        None => { pinocchio::msg!("ac:old=0"); return Err(ProgramError::MissingRequiredSignature); }
+    };
 
-    let old_ai = old_ai_opt.ok_or(ProgramError::MissingRequiredSignature)?;
-    let new_ai = new_ai_opt.ok_or(ProgramError::MissingRequiredSignature)?;
-    let new_authorized = *new_ai.key();
-    if old_ai.is_signer() {
-        pinocchio::msg!("authc:old_is_signer=1");
-    } else {
-        pinocchio::msg!("authc:old_is_signer=0");
+    // If lockup in force, custodian must sign; otherwise optional
+    let in_force = match &state {
+        StakeStateV2::Initialized(meta) | StakeStateV2::Stake(meta, _, _) => meta.lockup.is_in_force(&clock, None),
+        _ => false,
+    };
+    let maybe_custodian = rest
+        .iter()
+        .find(|ai| ai.is_signer() && ai.key() == &custodian_pk);
+    // Native: custodian only required when changing withdrawer and lockup is in force
+    if matches!(authority_type, StakeAuthorize::Withdrawer) && in_force && maybe_custodian.is_none() {
+        pinocchio::msg!("ac:need_cust");
         return Err(ProgramError::MissingRequiredSignature);
     }
+
+    // Determine new_authorized from metas by position/content and require it be a signer (native)
+    let mut new_ai_opt: Option<&AccountInfo> = None;
+    for ai in rest.iter() {
+        let k = ai.key();
+        if k == &pinocchio::sysvars::clock::CLOCK_ID || k == stake_ai.key() || maybe_custodian.map_or(false, |c| k == c.key()) || k == old_ai.key() {
+            continue;
+        }
+        new_ai_opt = Some(ai);
+        break;
+    }
+    let new_ai = new_ai_opt.ok_or(ProgramError::InvalidInstructionData)?;
     if !new_ai.is_signer() {
         return Err(ProgramError::MissingRequiredSignature);
     }
-
-    // Optional custodian among trailing accounts (must sign if required by lockup)
-    let maybe_custodian = accounts[1..]
-        .iter()
-        .find(|ai| ai.is_signer() && ai.key() == &custodian_pk);
+    let new_authorized = *new_ai.key();
 
     // Restrict authorities to [old, (custodian?)]
     let mut signers = [Pubkey::default(); 2];
     let mut n = 0usize;
     signers[n] = *old_ai.key();
     n += 1;
-    if let Some(c) = maybe_custodian {
-        signers[n] = *c.key();
-        n += 1;
-    }
+    if let Some(c) = maybe_custodian { signers[n] = *c.key(); n += 1; }
     let signers = &signers[..n];
 
     match state {

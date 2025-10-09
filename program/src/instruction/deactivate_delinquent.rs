@@ -22,15 +22,84 @@ use crate::helpers::constant::MINIMUM_DELINQUENT_EPOCHS_FOR_DEACTIVATION;
 
 pub fn process_deactivate_delinquent(accounts: &[AccountInfo]) -> ProgramResult {
     msg!("Instruction: DeactivateDelinquent");
-    // --- Canonical order: [stake, delinquent_vote, reference_vote] ---
     if accounts.len() < 3 { return Err(ProgramError::NotEnoughAccountKeys); }
-    let [stake_ai, delinquent_vote_ai, reference_vote_ai, ..] = accounts else {
+
+    // Prefer canonical wire order: [stake, delinquent_vote, reference_vote]
+    let [stake_ai, delinquent_cand, reference_cand, ..] = accounts else {
         return Err(ProgramError::InvalidAccountData);
     };
+
     let vote_pid = vote_program_id();
     if *stake_ai.owner() != crate::ID || !stake_ai.is_writable() {
         return Err(ProgramError::InvalidAccountOwner);
     }
+
+    // Current epoch (Pinocchio-safe)
+    let clock = Clock::get()?;
+    let n = MINIMUM_DELINQUENT_EPOCHS_FOR_DEACTIVATION;
+
+    // Helper: validate a candidate pair according to native vote semantics
+    let validate_pair = |del_ai: &AccountInfo, ref_ai: &AccountInfo| -> Result<(bool, bool), ProgramError> {
+        // reference_ok
+        let ref_ok = {
+            let data = ref_ai.try_borrow_data()?;
+            data.len() >= 4
+                && acceptable_reference_epoch_credits_bytes(&data, clock.epoch, n)?
+        };
+        // delinquent_ok
+        let del_ok = {
+            let data = del_ai.try_borrow_data()?;
+            if data.len() < 4 { true } else { match last_vote_epoch_bytes(&data)? {
+                None => true,
+                Some(last) => match clock.epoch.checked_sub(n) {
+                    Some(min_epoch) => last <= min_epoch,
+                    None => false,
+                }
+            } }
+        };
+        Ok((ref_ok, del_ok))
+    };
+
+    // 1) Try canonical ordering first
+    let mut reference_vote_ai = reference_cand;
+    let mut delinquent_vote_ai = delinquent_cand;
+    let (ref_ok, del_ok) = validate_pair(delinquent_vote_ai, reference_vote_ai)?;
+
+    // 2) If canonical invalid or ambiguous (same account), scan to resolve
+    if !(ref_ok && del_ok) || core::ptr::eq::<AccountInfo>(reference_vote_ai, delinquent_vote_ai) {
+        let mut found_ref: Option<&AccountInfo> = None;
+        let mut found_del: Option<&AccountInfo> = None;
+        for ai in accounts.iter() {
+            if core::ptr::eq::<AccountInfo>(ai, stake_ai) { continue; }
+            if let Ok(bytes) = ai.try_borrow_data() {
+                if bytes.len() >= 4 && found_ref.is_none() {
+                    if acceptable_reference_epoch_credits_bytes(&bytes, clock.epoch, n).unwrap_or(false) {
+                        found_ref = Some(ai);
+                    }
+                }
+                if found_del.is_none() {
+                    if bytes.len() < 4 {
+                        found_del = Some(ai);
+                    } else if let Ok(Some(last)) = last_vote_epoch_bytes(&bytes) {
+                        if let Some(min_epoch) = clock.epoch.checked_sub(n) {
+                            if last <= min_epoch { found_del = Some(ai); }
+                        }
+                    } else if let Ok(None) = last_vote_epoch_bytes(&bytes) {
+                        found_del = Some(ai);
+                    }
+                }
+                if let (Some(rf), Some(dl)) = (found_ref, found_del) {
+                    if !core::ptr::eq::<AccountInfo>(rf, dl) { break; }
+                    // same account cannot be both; keep ref, continue searching del
+                    found_del = None;
+                }
+            }
+        }
+        reference_vote_ai = found_ref.unwrap_or(reference_cand);
+        delinquent_vote_ai = found_del.unwrap_or(delinquent_cand);
+    }
+
+    // Final owner checks (optional strictness)
     #[cfg(feature = "strict-authz")]
     {
         if *reference_vote_ai.owner() != vote_pid || *delinquent_vote_ai.owner() != vote_pid {
@@ -38,116 +107,31 @@ pub fn process_deactivate_delinquent(accounts: &[AccountInfo]) -> ProgramResult 
         }
     }
 
-    // Probe owners and data lens
-    // Owner/data probes removed
-
-    // --- Clock (use current epoch) ---
-    let clock = Clock::get()?;
-    //
-
-    // --- Owner checks done above ---
-
-    // --- Robust meta resolution: scan accounts for vote-like data to find reference and delinquent ---
-    let n = MINIMUM_DELINQUENT_EPOCHS_FOR_DEACTIVATION;
-    let mut ref_ai: Option<&AccountInfo> = None;
-    let mut del_ai: Option<&AccountInfo> = None;
-    for ai in accounts.iter() {
-        // Skip stake account itself
-        if core::ptr::eq::<AccountInfo>(ai, stake_ai) { continue; }
-        if let Ok(data) = ai.try_borrow_data() {
-            if data.len() < 4 { continue; }
-            // reference candidate: N consecutive epochs ending at current or current-1
-            if ref_ai.is_none() {
-                if acceptable_reference_epoch_credits_bytes(&data, clock.epoch, n).unwrap_or(false) {
-                    ref_ai = Some(ai);
-                }
-            }
-            // delinquent candidate: last vote epoch <= current - N (or never voted)
-            if del_ai.is_none() {
-                match last_vote_epoch_bytes(&data) {
-                    Ok(None) => { del_ai = Some(ai); }
-                    Ok(Some(last_epoch)) => {
-                        if let Some(min_epoch) = clock.epoch.checked_sub(n) {
-                            if last_epoch <= min_epoch { del_ai = Some(ai); }
-                        }
-                    }
-                    Err(_) => {}
-                }
-            }
-            if ref_ai.is_some() && del_ai.is_some() {
-                // ensure distinct
-                if core::ptr::eq::<AccountInfo>(ref_ai.unwrap(), del_ai.unwrap()) {
-                    // If same, prefer keeping ref, continue to find a different del
-                    del_ai = None;
-                } else {
-                    break;
-                }
-            }
-        }
+    // Authoritative validation and branching by native error codes
+    let (ref_ok2, del_ok2) = validate_pair(delinquent_vote_ai, reference_vote_ai)?;
+    if !ref_ok2 {
+        return Err(to_program_error(StakeError::InsufficientReferenceVotes));
+    }
+    if !del_ok2 {
+        return Err(to_program_error(StakeError::MinimumDelinquentEpochsForDeactivationNotMet));
     }
 
-    // If robust scan found both, override the passed metas; else, use the provided positions
-    let (reference_vote_ai, delinquent_vote_ai) = match (ref_ai, del_ai) {
-        (Some(r), Some(d)) => (r, d),
-        _ => (reference_vote_ai, delinquent_vote_ai),
-    };
-
-    // --- 1) Reference must have a vote in EACH of the last N epochs (strict consecutive) ---
-    {
-        let data = reference_vote_ai.try_borrow_data()?;
-        // If the reference vote account has no credits history, treat as insufficient reference votes
-        if data.len() < 4 {
-            return Err(to_program_error(StakeError::InsufficientReferenceVotes));
-        }
-        let ok = acceptable_reference_epoch_credits_bytes(
-            &data,
-            clock.epoch,
-            MINIMUM_DELINQUENT_EPOCHS_FOR_DEACTIVATION,
-        )?;
-        if !ok {
-            return Err(to_program_error(StakeError::InsufficientReferenceVotes));
-        }
-    }
-    //
-
-    // --- 2) Delinquent last vote epoch <= current_epoch - N  ---
-    let delinquent_is_eligible = {
-        let data = delinquent_vote_ai.try_borrow_data()?;
-        // If there is no history at all, treat as never voted => eligible
-        if data.len() < 4 { true } else { match last_vote_epoch_bytes(&data)? {
-            None => true, // never voted => eligible
-            Some(last_epoch) => match clock.epoch.checked_sub(MINIMUM_DELINQUENT_EPOCHS_FOR_DEACTIVATION) {
-                Some(min_epoch) => last_epoch <= min_epoch,
-                None => false,
-            }
-        } }
-    };
-    //
-
-    // --- 3) Load stake state, verify delegation target, deactivate if eligible ---
+    // Load stake and deactivate if matching delegation
     match get_stake_state(stake_ai)? {
         StakeStateV2::Stake(meta, mut stake, flags) => {
             if stake.delegation.voter_pubkey != *delinquent_vote_ai.key() {
                 return Err(to_program_error(StakeError::VoteAddressMismatch));
             }
-
-            if delinquent_is_eligible {
-                // Set deactivation_epoch = current epoch
-                stake.deactivate(clock.epoch.to_le_bytes())
-                    .map_err(to_program_error)?;
-                set_stake_state(stake_ai, &StakeStateV2::Stake(meta, stake, flags))
-            } else {
-                Err(to_program_error(
-                    StakeError::MinimumDelinquentEpochsForDeactivationNotMet,
-                ))
-            }
+            // Set deactivation_epoch = current epoch (Epoch is [u8;8])
+            stake.deactivate(clock.epoch.to_le_bytes()).map_err(to_program_error)?;
+            set_stake_state(stake_ai, &StakeStateV2::Stake(meta, stake, flags))
         }
         _ => Err(ProgramError::InvalidAccountData),
     }
 }
 
 
-fn has_consecutive_epochs_bytes(data: &[u8], start_epoch: u64, n: u64) -> Result<bool, ProgramError> {
+fn has_consecutive_epochs_bytes(data: &[u8], end_epoch: u64, n: u64) -> Result<bool, ProgramError> {
     // Layout: [u32 count] followed by count triplets of (epoch, credits, prev_credits)
     if data.len() < 4 { return Err(ProgramError::InvalidAccountData); }
     let mut n_bytes = [0u8; 4];
@@ -158,12 +142,23 @@ fn has_consecutive_epochs_bytes(data: &[u8], start_epoch: u64, n: u64) -> Result
     for i in 0..(n as usize) {
         let idx_from_end = count - 1 - i; // walk newest backward
         let off = 4 + idx_from_end * 24;
-        if off + 8 > data.len() { return Err(ProgramError::InvalidAccountData); }
+        if off + 24 > data.len() { return Err(ProgramError::InvalidAccountData); }
         let mut e = [0u8; 8];
+        let mut c = [0u8; 8];
+        let mut p = [0u8; 8];
         e.copy_from_slice(&data[off..off + 8]);
+        c.copy_from_slice(&data[off + 8..off + 16]);
+        p.copy_from_slice(&data[off + 16..off + 24]);
         let epoch = u64::from_le_bytes(e);
-        let expected = start_epoch.saturating_sub(i as u64);
-        if epoch != expected { return Ok(false); }
+        let credits = u64::from_le_bytes(c);
+        let prev = u64::from_le_bytes(p);
+        // Expect a consecutive run ending at `end_epoch` and a positive vote (credits > prev)
+        let expected = end_epoch.saturating_sub(i as u64);
+        if epoch != expected || credits <= prev {
+            #[cfg(feature = "cu-trace")]
+            { pinocchio::msg!("dd:ref_mismatch"); }
+            return Ok(false);
+        }
     }
     Ok(true)
 }
@@ -190,13 +185,21 @@ fn last_vote_epoch_bytes(data: &[u8]) -> Result<Option<u64>, ProgramError> {
     if count == 0 {
         return Ok(None);
     }
-    let off = 4 + (count - 1) * 24;
-    if off + 8 > data.len() {
-        return Err(ProgramError::InvalidAccountData);
+    // Walk newest to oldest; return newest epoch with a positive vote (credits > prev)
+    for i in (0..count).rev() {
+        let off = 4 + i * 24;
+        if off + 24 > data.len() { return Err(ProgramError::InvalidAccountData); }
+        let mut e = [0u8; 8];
+        let mut c = [0u8; 8];
+        let mut p = [0u8; 8];
+        e.copy_from_slice(&data[off..off + 8]);
+        c.copy_from_slice(&data[off + 8..off + 16]);
+        p.copy_from_slice(&data[off + 16..off + 24]);
+        if u64::from_le_bytes(c) > u64::from_le_bytes(p) {
+            return Ok(Some(u64::from_le_bytes(e)));
+        }
     }
-    let mut e = [0u8; 8];
-    e.copy_from_slice(&data[off..off + 8]);
-    Ok(Some(u64::from_le_bytes(e)))
+    Ok(None)
 }
 #[cfg(test)]
 mod tests {

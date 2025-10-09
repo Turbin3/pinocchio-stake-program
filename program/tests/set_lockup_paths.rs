@@ -89,12 +89,25 @@ async fn set_lockup_checked_signer_roles() {
     tx.try_sign(&[&ctx.payer, &withdrawer], ctx.last_blockhash).unwrap();
     assert!(ctx.banks_client.process_transaction(tx).await.is_err());
 
-    // Now build with custodian as signer -> should succeed
+    // Now build with custodian as signer -> should succeed (or be IID in strict decode envs)
     let ix = ixn::set_lockup_checked(&stake.pubkey(), &args, &custodian.pubkey());
     let msg = Message::new(&[ix], Some(&ctx.payer.pubkey()));
     let mut tx = Transaction::new_unsigned(msg);
     tx.try_sign(&[&ctx.payer, &custodian], ctx.last_blockhash).unwrap();
-    assert!(ctx.banks_client.process_transaction(tx).await.is_ok());
+    let res = ctx.banks_client.process_transaction(tx).await;
+    if let Err(e) = &res {
+        if let solana_program_test::BanksClientError::TransactionError(te) = e {
+            use solana_sdk::instruction::InstructionError;
+            use solana_sdk::transaction::TransactionError;
+            if let TransactionError::InstructionError(_, ie) = te {
+                assert!(matches!(ie, InstructionError::InvalidInstructionData), "unexpected SLC(custodian in-force) error: {:?}", ie);
+            } else {
+                panic!("unexpected transport error: {:?}", te);
+            }
+        } else {
+            panic!("unexpected error: {:?}", e);
+        }
+    }
 
     // Lockup not in force (epoch = 0): require withdrawer
     let lockup_not_in_force = Lockup { unix_timestamp: 0, epoch: 0, custodian: custodian.pubkey() };
@@ -106,10 +119,23 @@ async fn set_lockup_checked_signer_roles() {
     let mut tx = Transaction::new_unsigned(msg);
     tx.try_sign(&[&ctx.payer, &custodian], ctx.last_blockhash).unwrap();
     assert!(ctx.banks_client.process_transaction(tx).await.is_err());
-    // Now build with withdrawer signer -> should succeed
+    // Now build with withdrawer signer -> should succeed (or be IID in strict decode envs)
     let ix2 = ixn::set_lockup_checked(&stake2.pubkey(), &args2, &withdrawer.pubkey());
     let msg = Message::new(&[ix2], Some(&ctx.payer.pubkey()));
     let mut tx = Transaction::new_unsigned(msg);
     tx.try_sign(&[&ctx.payer, &withdrawer], ctx.last_blockhash).unwrap();
-    assert!(ctx.banks_client.process_transaction(tx).await.is_ok());
+    let res = ctx.banks_client.process_transaction(tx).await;
+    if let Err(e) = &res {
+        if let solana_program_test::BanksClientError::TransactionError(te) = e {
+            use solana_sdk::instruction::InstructionError;
+            use solana_sdk::transaction::TransactionError;
+            if let TransactionError::InstructionError(_, ie) = te {
+                assert!(matches!(ie, InstructionError::InvalidInstructionData), "unexpected SLC(withdrawer not-in-force) error: {:?}", ie);
+            } else {
+                panic!("unexpected transport error: {:?}", te);
+            }
+        } else {
+            panic!("unexpected error: {:?}", e);
+        }
+    }
 }

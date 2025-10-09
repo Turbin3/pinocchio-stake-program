@@ -160,21 +160,6 @@ pub fn process_merge(accounts: &[AccountInfo]) -> ProgramResult {
 
     // Fast-path already attempted using raw states above
 
-    // Special-case: allow Activating source into Inactive destination (symmetry)
-    pinocchio::msg!("merge:check_inline");
-    if let (MergeKind::Inactive(dst_meta, dst_lamports, dst_flags),
-            MergeKind::ActivationEpoch(_, src_stake, src_flags)) = (dst_kind.clone(), src_kind.clone()) {
-        pinocchio::msg!("merge:inline IN+AE");
-        let new_stake = checked_add(bytes_to_u64(src_stake.delegation.stake), dst_lamports)?;
-        let mut stake_out = src_stake;
-        stake_out.delegation.stake = new_stake.to_le_bytes();
-        let merged_flags = dst_flags.union(src_flags);
-        set_stake_state(dst_ai, &StakeStateV2::Stake(dst_meta, stake_out, merged_flags))?;
-        set_stake_state(src_ai, &StakeStateV2::Uninitialized)?;
-        relocate_lamports(src_ai, dst_ai, src_ai.lamports())?;
-        return Ok(());
-    }
-
     // Perform merge inline for all supported shape pairs; otherwise error
     match (dst_kind.clone(), src_kind.clone()) {
         (MergeKind::Inactive(_, _, _), MergeKind::Inactive(_, _, _)) => {
@@ -183,9 +168,14 @@ pub fn process_merge(accounts: &[AccountInfo]) -> ProgramResult {
             relocate_lamports(src_ai, dst_ai, src_ai.lamports())?;
             return Ok(());
         }
-        (MergeKind::Inactive(dst_meta, dst_lamports, dst_flags), MergeKind::ActivationEpoch(_, src_stake, src_flags)) => {
-            pinocchio::msg!("merge:inline IN+AE(fallback)");
-            let new_stake = checked_add(bytes_to_u64(src_stake.delegation.stake), dst_lamports)?;
+        (MergeKind::Inactive(dst_meta, _dst_lamports, dst_flags), MergeKind::ActivationEpoch(_, src_stake, src_flags)) => {
+            pinocchio::msg!("merge:inline IN+AE");
+            // New delegated stake equals total post-merge lamports minus destination's rent-exempt reserve.
+            let total_post = checked_add(dst_ai.lamports(), src_ai.lamports())?;
+            let dst_reserve = bytes_to_u64(dst_meta.rent_exempt_reserve);
+            let new_stake = total_post
+                .checked_sub(dst_reserve)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
             let mut stake_out = src_stake;
             stake_out.delegation.stake = new_stake.to_le_bytes();
             let merged_flags = dst_flags.union(src_flags);

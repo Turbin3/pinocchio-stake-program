@@ -13,25 +13,23 @@ use crate::{
 };
 
 pub fn process_deactivate(accounts: &[AccountInfo]) -> ProgramResult {
+    // Tolerant handler: accept any meta count >= 1, enforce staker signature via Authorized::check.
     if accounts.is_empty() { return Err(ProgramError::NotEnoughAccountKeys); }
+    let stake_ai = &accounts[0];
 
-    // Gather tx signers (repo-compatible behavior)
+    // Gather tx signers
     let mut signers_buf = [Pubkey::default(); MAXIMUM_SIGNERS];
     let signers_len = collect_signers(accounts, &mut signers_buf)?;
     let signers = &signers_buf[..signers_len];
 
-    let stake_ai = &accounts[0];
-
-    // Native-like error split
+    // Basic checks
     if *stake_ai.owner() != crate::ID { return Err(ProgramError::InvalidAccountOwner); }
     if !stake_ai.is_writable() { return Err(ProgramError::InvalidInstructionData); }
 
     let clock = Clock::get()?;
-
-    // Load stake state and apply
     match get_stake_state(stake_ai)? {
         StakeStateV2::Stake(meta, mut stake, flags) => {
-            // Require staker signature (from tx signers)
+            // Enforce staker signature (maps to MissingRequiredSignature on failure)
             meta.authorized
                 .check(signers, StakeAuthorize::Staker)
                 .map_err(to_program_error)?;

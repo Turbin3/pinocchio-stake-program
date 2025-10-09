@@ -22,15 +22,13 @@ use crate::{
 /// derived = sha256(base || seed || owner)
 fn derive_with_seed_compat(base: &Pubkey, seed: &[u8], owner: &Pubkey) -> Result<Pubkey, ProgramError> {
     if seed.len() > 32 { return Err(ProgramError::InvalidInstructionData); }
-    let mut buf = [0u8; 96];
+    let mut buf = [0u8; 32 + 32 + 32];
     let mut off = 0usize;
     buf[off..off+32].copy_from_slice(&base[..]); off += 32;
-    buf[off..off+seed.len()].copy_from_slice(seed); off += seed.len();
+    if !seed.is_empty() { buf[off..off+seed.len()].copy_from_slice(seed); }
+    off += seed.len();
     buf[off..off+32].copy_from_slice(&owner[..]); off += 32;
-    let mut out = [0u8; 32];
-    const SUCCESS: u64 = 0;
-    let rc = unsafe { pinocchio::syscalls::sol_sha256(buf.as_ptr(), off as u64, out.as_mut_ptr()) };
-    if rc != SUCCESS { return Err(ProgramError::InvalidInstructionData); }
+    let out = crate::crypto::sha256::hash(&buf[..off]);
     Ok(out)
 }
 
@@ -65,14 +63,19 @@ pub fn process_authorized_with_seeds(
     let state = get_stake_state(stake_ai)?;
 
     // Derive authority from (base, seed, owner)
-    let derived = derive_with_seed_compat(base_ai.key(), args.authority_seed, &args.authority_owner)?;
+    // Reject seeds longer than 32 (native behavior)
+    let seed_len = args.authority_seed.len();
+    if seed_len > 32 { return Err(ProgramError::InvalidInstructionData); }
+    let mut seed_buf = [0u8; 32];
+    if seed_len > 0 { seed_buf[..seed_len].copy_from_slice(&args.authority_seed[..seed_len]); }
+    let mut derived = derive_with_seed_compat(base_ai.key(), &seed_buf[..seed_len], &args.authority_owner)?;
 
     // Derived must match current role; for Staker, allow withdrawer to rotate staker (parity)
     let (staker_pk, withdrawer_pk) = match &state {
         StakeStateV2::Initialized(meta) | StakeStateV2::Stake(meta, _, _) => (meta.authorized.staker, meta.authorized.withdrawer),
         _ => return Err(ProgramError::InvalidAccountData),
     };
-    let derived_is_allowed_old = match role {
+    let mut derived_is_allowed_old = match role {
         StakeAuthorize::Staker => derived == staker_pk || derived == withdrawer_pk,
         StakeAuthorize::Withdrawer => derived == withdrawer_pk,
     };

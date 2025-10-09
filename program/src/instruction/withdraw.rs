@@ -12,6 +12,8 @@ use crate::{
 
 };
 use pinocchio::pubkey::Pubkey;
+#[cfg(feature = "cu-trace")]
+use pinocchio::msg;
 use pinocchio::sysvars::{rent::Rent, Sysvar};
 
 //

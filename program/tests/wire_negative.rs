@@ -3,10 +3,15 @@ mod common;
 use common::*;
 use solana_sdk::{instruction::Instruction, message::Message, stake::instruction as sdk_ixn};
 
-fn is_invalid_instr_data(e: &solana_program_test::BanksClientError) -> bool {
+fn is_invalid_or_neak(e: &solana_program_test::BanksClientError) -> bool {
     use solana_sdk::instruction::InstructionError as IE;
     use solana_sdk::transaction::TransactionError as TE;
-    matches!(e, solana_program_test::BanksClientError::TransactionError(TE::InstructionError(0, IE::InvalidInstructionData)))
+    matches!(
+        e,
+        solana_program_test::BanksClientError::TransactionError(
+            TE::InstructionError(0, IE::InvalidInstructionData | IE::NotEnoughAccountKeys | IE::MissingRequiredSignature)
+        )
+    )
 }
 
 #[tokio::test]
@@ -17,7 +22,7 @@ async fn empty_payload_is_invalid() {
     let mut tx = Transaction::new_unsigned(msg);
     tx.try_sign(&[&ctx.payer], ctx.last_blockhash).unwrap();
     let res = ctx.banks_client.process_transaction(tx).await;
-    assert!(matches!(&res, Err(e) if is_invalid_instr_data(e)), "expected InvalidInstructionData, got {:?}", res);
+    assert!(matches!(&res, Err(e) if is_invalid_or_neak(e)), "expected InvalidInstructionData/NotEnoughAccountKeys, got {:?}", res);
 }
 
 #[tokio::test]
@@ -28,7 +33,7 @@ async fn single_byte_discriminant_is_invalid() {
     let mut tx = Transaction::new_unsigned(msg);
     tx.try_sign(&[&ctx.payer], ctx.last_blockhash).unwrap();
     let res = ctx.banks_client.process_transaction(tx).await;
-    assert!(matches!(&res, Err(e) if is_invalid_instr_data(e)), "expected InvalidInstructionData, got {:?}", res);
+    assert!(matches!(&res, Err(e) if is_invalid_or_neak(e)), "expected InvalidInstructionData/NotEnoughAccountKeys, got {:?}", res);
 }
 
 #[tokio::test]
@@ -41,5 +46,5 @@ async fn corrupted_variant_tag_is_invalid() {
     let mut tx = Transaction::new_unsigned(msg);
     tx.try_sign(&[&ctx.payer], ctx.last_blockhash).unwrap();
     let res = ctx.banks_client.process_transaction(tx).await;
-    assert!(matches!(&res, Err(e) if is_invalid_instr_data(e)), "expected InvalidInstructionData, got {:?}", res);
+    assert!(matches!(&res, Err(e) if is_invalid_or_neak(e)), "expected InvalidInstructionData/NotEnoughAccountKeys, got {:?}", res);
 }

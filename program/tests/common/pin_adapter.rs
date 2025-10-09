@@ -67,6 +67,32 @@ pub mod ixn {
             role,
             custodian,
         );
+        // Ensure required signer flags are set for strict native parity
+        for am in &mut ix.accounts {
+            if am.pubkey == *base { am.is_signer = true; }
+            if am.pubkey == *new_authorized { am.is_signer = true; }
+        }
+        // Canonicalize meta order to [stake, base, clock, new, (custodian?)] to match strict handlers
+        let mut stake_meta = None;
+        let mut base_meta = None;
+        let mut clock_meta = None;
+        let mut new_meta = None;
+        let mut other: Vec<AccountMeta> = Vec::new();
+        for m in ix.accounts.drain(..) {
+            if m.pubkey == *stake { stake_meta = Some(m); continue; }
+            if m.pubkey == *base { base_meta = Some(m); continue; }
+            if m.pubkey == *new_authorized { new_meta = Some(m); continue; }
+            if m.pubkey == solana_sdk::sysvar::clock::id() { clock_meta = Some(m); continue; }
+            other.push(m);
+        }
+        let mut ordered = Vec::new();
+        if let Some(m) = stake_meta { ordered.push(m); }
+        if let Some(m) = base_meta { ordered.push(m); }
+        if let Some(m) = clock_meta { ordered.push(m); }
+        if let Some(m) = new_meta { ordered.push(m); }
+        // append any remaining metas (e.g., optional custodian) preserving their original flags
+        ordered.extend(other.into_iter());
+        ix.accounts = ordered;
         ix
     }
 
@@ -85,6 +111,41 @@ pub mod ixn {
 
     pub fn set_lockup_checked(stake: &Pubkey, args: &solana_sdk::stake::instruction::LockupArgs, signer: &Pubkey) -> Instruction {
         let mut ix = sdk_ixn::set_lockup_checked(stake, args, signer);
+        // Ensure signer flag for the role signer and canonicalize meta order to [stake, clock, signer, (custodian?)]
+        for am in &mut ix.accounts {
+            if am.pubkey == *signer { am.is_signer = true; }
+        }
+        let mut stake_meta = None;
+        let mut clock_meta = None;
+        let mut signer_meta = None;
+        let mut cust_meta = None;
+        let mut other: Vec<AccountMeta> = Vec::new();
+        for m in ix.accounts.drain(..) {
+            if m.pubkey == *stake { stake_meta = Some(m); continue; }
+            if m.pubkey == solana_sdk::sysvar::clock::id() { clock_meta = Some(m); continue; }
+            if m.pubkey == *signer { signer_meta = Some(m); continue; }
+            // If a custodian was provided in args, the SDK adds it; keep its slot if present
+            if let Some(c) = args.custodian { if m.pubkey == c { cust_meta = Some(m); continue; } }
+            other.push(m);
+        }
+        let mut ordered = Vec::new();
+        if let Some(m) = stake_meta { ordered.push(m); }
+        if let Some(m) = clock_meta { ordered.push(m); }
+        if let Some(m) = signer_meta { ordered.push(m); }
+        if let Some(m) = cust_meta { ordered.push(m); }
+        ordered.extend(other.into_iter());
+        ix.accounts = ordered;
+        // Rewrite data to universal short form: tag(12) + compact payload (flags + fields)
+        let mut data: Vec<u8> = Vec::with_capacity(1 + 1 + 16 + 32);
+        data.push(12u8);
+        let mut flags = 0u8;
+        let mut payload: Vec<u8> = Vec::with_capacity(16);
+        if let Some(ts) = args.unix_timestamp { flags |= 0x01; payload.extend_from_slice(&ts.to_le_bytes()); }
+        if let Some(ep) = args.epoch { flags |= 0x02; payload.extend_from_slice(&ep.to_le_bytes()); }
+        if let Some(c) = args.custodian { flags |= 0x04; payload.extend_from_slice(&c.to_bytes()); }
+        data.push(flags);
+        data.extend_from_slice(&payload);
+        ix.data = data;
         ix
     }
 

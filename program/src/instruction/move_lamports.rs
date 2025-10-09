@@ -45,18 +45,7 @@ pub fn process_move_lamports(accounts: &[AccountInfo], lamports: u64) -> Program
     )?;
     // shared checks complete
 
-    // Extra guard for lamports: require identical authorities between source and destination
-    let src_auth = &source_kind.meta().authorized;
-    let dst_auth = &dest_kind.meta().authorized;
-    if src_auth != dst_auth {
-        return Err(crate::error::to_program_error(crate::error::StakeError::MergeMismatch));
-    }
-    pinocchio::msg!("ml:auths");
-    // Briefly tag source/destination (no pubkey formatting support, just markers)
-    pinocchio::msg!("ml:src");
-    let _ = source_stake_ai.key();
-    pinocchio::msg!("ml:dst");
-    let _ = destination_stake_ai.key();
+    // Authorities/lockups compatibility were already enforced by shared checks.
 
     // (post-check logging removed; pre-check above handles transient)
 
@@ -82,8 +71,8 @@ pub fn process_move_lamports(accounts: &[AccountInfo], lamports: u64) -> Program
                 let delegated = crate::helpers::bytes_to_u64(stake.delegation.stake);
                 if delegated == 0 { pinocchio::msg!("ml:deleg0"); } else { pinocchio::msg!("ml:delegN"); }
                 pinocchio::msg!("ml:fa");
-                let assumed = core::cmp::max(delegated, crate::helpers::get_minimum_delegation());
-                total.saturating_sub(rent_reserve).saturating_sub(assumed)
+                // Native parity: free = total - rent - delegated
+                total.saturating_sub(rent_reserve).saturating_sub(delegated)
             }
             MergeKind::ActivationEpoch(_, _, _) => {
                 pinocchio::msg!("ml:transient_act");

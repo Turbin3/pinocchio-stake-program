@@ -16,6 +16,10 @@ use crate::state::stake_history::StakeHistorySysvar;
 use crate::state::{StakeAuthorize, StakeFlags, StakeStateV2};
 
 pub fn process_delegate(accounts: &[AccountInfo]) -> ProgramResult {
+    #[cfg(feature = "cu-trace")]
+    {
+        pinocchio::msg!("delegate:enter");
+    }
     // Gather signers
     let mut signers_array = [Pubkey::default(); MAXIMUM_SIGNERS];
     let signers_count = collect_signers(accounts, &mut signers_array)?;
@@ -37,6 +41,8 @@ pub fn process_delegate(accounts: &[AccountInfo]) -> ProgramResult {
     // clock will be validated by Clock::from_account_info
     // Require StakeHistory as 4th account for native parity (we don't deserialize it here)
     if stake_history_ai.key() != &crate::state::stake_history::ID {
+        #[cfg(feature = "cu-trace")]
+        { pinocchio::msg!("delegate:bad_stake_history"); }
         return Err(ProgramError::InvalidInstructionData);
     }
     // Optional 5th StakeConfig account accepted (shape parity), ignored if present

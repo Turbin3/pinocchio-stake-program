@@ -23,12 +23,14 @@ pub fn process_move_stake(accounts: &[AccountInfo], lamports: u64) -> ProgramRes
     let [source_stake_account_info, destination_stake_account_info, stake_authority_info] = accounts else {
         return Err(ProgramError::InvalidInstructionData);
     };
+    // Owner and writable checks with native-like error splits
     if *source_stake_account_info.owner() != crate::ID
         || *destination_stake_account_info.owner() != crate::ID
-        || !source_stake_account_info.is_writable()
-        || !destination_stake_account_info.is_writable()
     {
         return Err(ProgramError::InvalidAccountOwner);
+    }
+    if !source_stake_account_info.is_writable() || !destination_stake_account_info.is_writable() {
+        return Err(ProgramError::InvalidInstructionData);
     }
     pinocchio::msg!("mvstake:accs");
     // Resolve expected staker from source stake meta and ensure signer present
@@ -134,7 +136,7 @@ pub fn process_move_stake(accounts: &[AccountInfo], lamports: u64) -> ProgramRes
 
             set_stake_state(
                 destination_stake_account_info,
-                &StakeStateV2::Stake(destination_meta, destination_stake, dest_existing_flags),
+                &StakeStateV2::Stake(destination_meta, destination_stake, StakeFlags::empty()),
             )?;
 
             destination_meta

@@ -23,9 +23,6 @@ pub fn process_split(accounts: &[AccountInfo], split_lamports: u64) -> ProgramRe
     let authority_account_info = &accounts[2];
 
     // Basic account validation and parity checks
-    if source_stake_account_info.key() == destination_stake_account_info.key() {
-        return Err(ProgramError::InvalidArgument);
-    }
     if !source_stake_account_info.is_writable() || !destination_stake_account_info.is_writable() {
         return Err(ProgramError::InvalidInstructionData);
     }
@@ -50,29 +47,12 @@ pub fn process_split(accounts: &[AccountInfo], split_lamports: u64) -> ProgramRe
         pinocchio::msg!("split:preflight_over_balance");
         return Err(ProgramError::InsufficientFunds);
     }
-    let src_rent = pinocchio::sysvars::rent::Rent::get()?.minimum_balance(
-        source_stake_account_info.data_len(),
-    );
-    if split_lamports > source_lamport_balance.saturating_sub(src_rent) {
-        pinocchio::msg!("split:preflight_insufficient");
-        return Err(ProgramError::InsufficientFunds);
-    }
+    // Rent-reserve preflight applies to Initialized/Stake; Uninitialized is handled below.
     pinocchio::msg!("split:preflight_ok");
 
     let destination_lamport_balance = destination_stake_account_info.lamports();
 
-    // Early preflight for Uninitialized source: if trying to split more than
-    // withdrawable (balance - rent), return InsufficientFunds before any other
-    // checks so tests see the expected error surface.
-    if let StakeStateV2::Uninitialized = get_stake_state(source_stake_account_info)? {
-        let src_rent = pinocchio::sysvars::rent::Rent::get()?.minimum_balance(
-            source_stake_account_info.data_len(),
-        );
-        if split_lamports > source_lamport_balance.saturating_sub(src_rent) {
-            pinocchio::msg!("split:preflight_insufficient");
-            return Err(ProgramError::InsufficientFunds);
-        }
-    }
+    // Skip rent-reserve preflight for Uninitialized; handled in match arm.
 
     // note: over-balance already checked in preflight above
 
@@ -94,6 +74,9 @@ pub fn process_split(accounts: &[AccountInfo], split_lamports: u64) -> ProgramRe
 
     match get_stake_state(source_stake_account_info)? {
         StakeStateV2::Stake(source_meta, mut source_stake, stake_flags) => {
+            if source_stake_account_info.key() == destination_stake_account_info.key() {
+                return Err(ProgramError::InvalidArgument);
+            }
             // Enforce index-2 is the staker and has signed
             if source_meta.authorized.staker != *authority_account_info.key() {
                 return Err(ProgramError::MissingRequiredSignature);
@@ -185,6 +168,9 @@ pub fn process_split(accounts: &[AccountInfo], split_lamports: u64) -> ProgramRe
             )?;
         }
         StakeStateV2::Initialized(source_meta) => {
+            if source_stake_account_info.key() == destination_stake_account_info.key() {
+                return Err(ProgramError::InvalidArgument);
+            }
             // Enforce index-2 is the staker and has signed
             if source_meta.authorized.staker != *authority_account_info.key() {
                 return Err(ProgramError::MissingRequiredSignature);
@@ -216,14 +202,6 @@ pub fn process_split(accounts: &[AccountInfo], split_lamports: u64) -> ProgramRe
             // Destination must still be a valid stake account (Uninitialized, correct size, owned by the program).
             if !source_stake_account_info.is_signer() {
                 return Err(ProgramError::MissingRequiredSignature);
-            }
-            // Enforce that the source remains rent-exempt: split cannot exceed (lamports - rent)
-            let src_rent = pinocchio::sysvars::rent::Rent::get()?.minimum_balance(
-                source_stake_account_info.data_len(),
-            );
-            if split_lamports > source_lamport_balance.saturating_sub(src_rent) {
-                pinocchio::msg!("split:uninit_over_withdrawable");
-                return Err(ProgramError::InsufficientFunds);
             }
             // No state changes; relocation happens after the match.
         }

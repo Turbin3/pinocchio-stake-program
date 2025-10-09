@@ -35,7 +35,7 @@ bincode = "1"
 
 [features]
 # Build for the chain (SBF, no_std, real entrypoint, panic handler)
-sbf = ["bpf-entrypoint", "wire_bincode"]
+sbf = ["bpf-entrypoint", "wire_bincode", "compat_derivation_fallback"]
 
 # Controls the entrypoint module inclusion
 bpf-entrypoint = []
@@ -46,7 +46,8 @@ std = ["bincode"]
 
 # Default host/dev: std + NO entrypoint (keeps IDE/cargo happy)
 default = ["std", "no-entrypoint", "wire_bincode"]
-e2e = ["allow-uninitialized-split"]
+e2e = ["allow-uninitialized-split", "compat_derivation_fallback", "compat_loose_decode"]
+compat_derivation_fallback = []
 seed = []
 cu-trace = []
 wire_bincode = []
