@@ -16,7 +16,6 @@ use crate::{
 pub struct LockupCheckedData {
     pub unix_timestamp: Option<i64>,
     pub epoch: Option<u64>,
-    pub custodian: Option<[u8; 32]>,
 }
 
 impl LockupCheckedData {
@@ -26,7 +25,8 @@ impl LockupCheckedData {
             return Err(ProgramError::InvalidInstructionData);
         }
         let flags = data[0];
-        if flags & !0x07 != 0 {
+        // Only timestamp (0x01) and epoch (0x02) are valid for the checked variant
+        if flags & !0x03 != 0 {
             return Err(ProgramError::InvalidInstructionData);
         }
         let mut off = 1usize;
@@ -55,19 +55,11 @@ impl LockupCheckedData {
             None
         };
 
-        let custodian = if (flags & 0x04) != 0 {
-            if off + 32 > data.len() { return Err(ProgramError::InvalidInstructionData); }
-            let mut buf = [0u8; 32];
-            buf.copy_from_slice(&data[off..off + 32]);
-            off += 32;
-            Some(buf)
-        } else { None };
-
         if off != data.len() {
             return Err(ProgramError::InvalidInstructionData);
         }
 
-        Ok(Self { unix_timestamp, epoch, custodian })
+        Ok(Self { unix_timestamp, epoch })
     }
 }
 
@@ -135,13 +127,7 @@ pub fn process_set_lockup_checked(
                 stake_ai,
                 &_clock,
             )?;
-            // Checked variant: ignore custodian in data; accept optional new custodian as 3rd account.
-            if let Some(new_ai) = accounts.get(2) {
-                // Only update custodian if the optional account is a signer; otherwise ignore.
-                if new_ai.is_signer() {
-                    meta.lockup.custodian = *new_ai.key();
-                }
-            }
+            // Native checked semantics: do not modify custodian here
             set_stake_state(stake_ai, &StakeStateV2::Initialized(meta))?;
         }
         StakeStateV2::Stake(mut meta, stake, flags) => {
@@ -152,12 +138,7 @@ pub fn process_set_lockup_checked(
                 stake_ai,
                 &_clock,
             )?;
-            // Checked variant: ignore custodian in data; accept optional new custodian as 3rd account.
-            if let Some(new_ai) = accounts.get(2) {
-                if new_ai.is_signer() {
-                    meta.lockup.custodian = *new_ai.key();
-                }
-            }
+            // Native checked semantics: do not modify custodian here
             set_stake_state(stake_ai, &StakeStateV2::Stake(meta, stake, flags))?;
         }
         _ => {

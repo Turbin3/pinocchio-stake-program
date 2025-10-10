@@ -99,12 +99,9 @@ pub fn process_deactivate_delinquent(accounts: &[AccountInfo]) -> ProgramResult 
         delinquent_vote_ai = found_del.unwrap_or(delinquent_cand);
     }
 
-    // Final owner checks (optional strictness)
-    #[cfg(feature = "strict-authz")]
-    {
-        if *reference_vote_ai.owner() != vote_pid || *delinquent_vote_ai.owner() != vote_pid {
-            return Err(ProgramError::IncorrectProgramId);
-        }
+    // Enforce vote program ownership for both vote accounts
+    if *reference_vote_ai.owner() != vote_pid || *delinquent_vote_ai.owner() != vote_pid {
+        return Err(ProgramError::IncorrectProgramId);
     }
 
     // Authoritative validation and branching by native error codes

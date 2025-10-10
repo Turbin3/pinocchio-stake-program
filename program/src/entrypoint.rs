@@ -55,7 +55,10 @@ fn process_instruction(
     if instruction_data.len() < 4 { pinocchio::msg!("pre:lt4"); } else { pinocchio::msg!("pre:ge4"); }
     // Universal fast-path for ProgramTest short encodings (works in std and sbf)
     if instruction_data.is_empty() {
-        // Empty => DeactivateDelinquent
+        // Empty => DeactivateDelinquent (but respect epoch-rewards gating)
+        if epoch_rewards_active() {
+            return Err(to_program_error(StakeError::EpochRewardsActive));
+        }
         return crate::instruction::deactivate_delinquent::process_deactivate_delinquent(accounts);
     }
     if instruction_data.len() < 4 {
@@ -82,6 +85,9 @@ fn process_instruction(
                 }
                 // Pass through the compact payload (flags + fields) after the tag
                 let rest = &instruction_data[1..];
+                if epoch_rewards_active() {
+                    return Err(to_program_error(StakeError::EpochRewardsActive));
+                }
                 return crate::instruction::process_set_lockup_checked::process_set_lockup_checked(accounts, rest);
             }
             13 => {
@@ -93,7 +99,13 @@ fn process_instruction(
                 { /* ProgramTest reads return data via host */ }
                 return Ok(());
             }
-            14 | 18 | 19 | 20 | 21 => { return crate::instruction::deactivate_delinquent::process_deactivate_delinquent(accounts); }
+            #[cfg(feature = "compat_loose_decode")]
+            14 | 18 | 19 | 20 | 21 => {
+                if epoch_rewards_active() {
+                    return Err(to_program_error(StakeError::EpochRewardsActive));
+                }
+                return crate::instruction::deactivate_delinquent::process_deactivate_delinquent(accounts);
+            }
             _ => {}
         }
     }
@@ -125,6 +137,9 @@ fn process_instruction(
             if !accounts.iter().any(|ai| ai.is_signer()) { return Err(ProgramError::MissingRequiredSignature); }
         }
         let rest = &instruction_data[1..];
+        if epoch_rewards_active() {
+            return Err(to_program_error(StakeError::EpochRewardsActive));
+        }
         return crate::instruction::process_set_lockup_checked::process_set_lockup_checked(accounts, rest);
     }
     // Decode StakeInstruction via bincode (native wire). Feature is enabled by default.
@@ -146,8 +161,9 @@ fn process_instruction(
                 9  => SI::InitializeChecked,
                 10 => SI::AuthorizeChecked(wire::StakeAuthorize::Staker),
                 11 => SI::AuthorizeCheckedWithSeed(wire::AuthorizeCheckedWithSeedArgs { stake_authorize: wire::StakeAuthorize::Staker, authority_seed: alloc::string::String::new(), authority_owner: [0u8;32] }),
-                12 => SI::SetLockupChecked(wire::LockupCheckedArgs { unix_timestamp: None, epoch: None, custodian: None }),
+                12 => SI::SetLockupChecked(wire::LockupCheckedArgs { unix_timestamp: None, epoch: None }),
                 13 => SI::GetMinimumDelegation,
+                #[cfg(feature = "compat_loose_decode")]
                 14 | 18 | 19 | 20 | 21 => SI::DeactivateDelinquent,
                 5  => SI::Deactivate,
                 _ => return Err(ProgramError::InvalidInstructionData),
@@ -206,6 +222,9 @@ fn process_instruction(
         { pinocchio::msg!("sbf:inspect len={}", instruction_data.len() as u64); }
         // Tolerate empty and single-byte encodings for ProgramTest in SBF
         if instruction_data.is_empty() {
+            if epoch_rewards_active() {
+                return Err(to_program_error(StakeError::EpochRewardsActive));
+            }
             return crate::instruction::deactivate_delinquent::process_deactivate_delinquent(accounts);
         }
         if instruction_data.len() < 4 {
@@ -218,7 +237,8 @@ fn process_instruction(
                 9 => SI::InitializeChecked,
                 10 => SI::AuthorizeChecked(wire_sbf::StakeAuthorize::Staker),
                 11 => SI::AuthorizeCheckedWithSeed(wire_sbf::AuthorizeCheckedWithSeedArgs { stake_authorize: wire_sbf::StakeAuthorize::Staker, authority_seed: &[], authority_owner: [0u8;32] }),
-                12 => { pinocchio::msg!("sbf:slc:short" ); SI::SetLockupChecked(wire_sbf::LockupCheckedArgs { unix_timestamp: None, epoch: None, custodian: None }) },
+                12 => { pinocchio::msg!("sbf:slc:short" ); SI::SetLockupChecked(wire_sbf::LockupCheckedArgs { unix_timestamp: None, epoch: None }) },
+                #[cfg(feature = "compat_loose_decode")]
                 14 | 18 | 19 | 20 | 21 => SI::DeactivateDelinquent,
                 13 => SI::GetMinimumDelegation,
                 5 => SI::Deactivate,
@@ -306,7 +326,7 @@ mod wire {
     pub struct LockupArgs { pub unix_timestamp: Option<i64>, pub epoch: Option<u64>, pub custodian: Option<WirePubkey> }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct LockupCheckedArgs { pub unix_timestamp: Option<i64>, pub epoch: Option<u64>, pub custodian: Option<WirePubkey> }
+    pub struct LockupCheckedArgs { pub unix_timestamp: Option<i64>, pub epoch: Option<u64> }
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct AuthorizeWithSeedArgs { pub new_authorized_pubkey: WirePubkey, pub stake_authorize: StakeAuthorize, pub authority_seed: String, pub authority_owner: WirePubkey }
@@ -391,7 +411,11 @@ fn dispatch_wire_instruction(accounts: &[AccountInfo], ix: wire::StakeInstructio
             let seed_vec = args.authority_seed.into_bytes();
             let data = AuthorizeWithSeedData { new_authorized, stake_authorize, authority_seed: &seed_vec, authority_owner };
             // Keep seed_vec alive across the call
+            // Require at least one signer in metas (base must sign)
+            if !accounts.iter().any(|ai| ai.is_signer()) { return Err(ProgramError::MissingRequiredSignature); }
+            pinocchio::msg!("std:aws:precall");
             let res = instruction::process_authorized_with_seeds::process_authorized_with_seeds(accounts, data);
+            if res.is_err() { pinocchio::msg!("std:aws:ret_err"); }
             core::mem::drop(seed_vec);
             res
         }
@@ -409,7 +433,8 @@ fn dispatch_wire_instruction(accounts: &[AccountInfo], ix: wire::StakeInstructio
             let stake_authorize = match args.stake_authorize { StakeAuthorize::Staker => StakeAuthorize::Staker, StakeAuthorize::Withdrawer => StakeAuthorize::Withdrawer };
             let authority_owner = Pubkey::from(args.authority_owner);
             let seed_vec = args.authority_seed.into_bytes();
-            let new_authorized = accounts.get(3).map(|ai| *ai.key()).ok_or(ProgramError::NotEnoughAccountKeys)?;
+            // Native-ABI order: [stake, new_authorized, clock, base]
+            let new_authorized = accounts.get(1).map(|ai| *ai.key()).ok_or(ProgramError::NotEnoughAccountKeys)?;
             let data = AuthorizeCheckedWithSeedData { new_authorized, stake_authorize, authority_seed: &seed_vec, authority_owner };
             let res = instruction::process_authorize_checked_with_seed::process_authorize_checked_with_seed(accounts, data);
             core::mem::drop(seed_vec);
@@ -432,22 +457,12 @@ fn dispatch_wire_instruction(accounts: &[AccountInfo], ix: wire::StakeInstructio
             }
             // Minimal signer requirement: any signer in metas
             if !accounts.iter().any(|ai| ai.is_signer()) { return Err(ProgramError::MissingRequiredSignature); }
-            // If a new custodian is provided by args, require that account to be present and signer
-            if let Some(c) = args.custodian {
-                let want = Pubkey::from(c);
-                let ok = accounts.iter().any(|ai| ai.key() == &want && ai.is_signer());
-                if !ok {
-                    // Only require arg-custodian signer when lockup is in force
-                    if in_force { return Err(ProgramError::MissingRequiredSignature); }
-                }
-            }
             // Encode native args into the compact flags+payload expected by the handler
-            let mut buf = [0u8; 1 + 8 + 8 + 32];
+            let mut buf = [0u8; 1 + 8 + 8];
             let mut off = 1usize;
             let mut flags = 0u8;
             if let Some(ts) = args.unix_timestamp { flags |= 0x01; buf[off..off + 8].copy_from_slice(&ts.to_le_bytes()); off += 8; }
             if let Some(ep) = args.epoch { flags |= 0x02; buf[off..off + 8].copy_from_slice(&ep.to_le_bytes()); off += 8; }
-            if let Some(c) = args.custodian { flags |= 0x04; let pk = Pubkey::from(c).to_bytes(); buf[off..off+32].copy_from_slice(&pk); off += 32; }
             buf[0] = flags;
             instruction::process_set_lockup_checked::process_set_lockup_checked(accounts, &buf[..off])
         }
@@ -494,7 +509,7 @@ mod wire_sbf {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct LockupArgs { pub unix_timestamp: Option<i64>, pub epoch: Option<u64>, pub custodian: Option<WirePubkey> }
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct LockupCheckedArgs { pub unix_timestamp: Option<i64>, pub epoch: Option<u64>, pub custodian: Option<WirePubkey> }
+    pub struct LockupCheckedArgs { pub unix_timestamp: Option<i64>, pub epoch: Option<u64> }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct AuthorizeWithSeedArgs<'a> { pub new_authorized_pubkey: WirePubkey, pub stake_authorize: StakeAuthorize, pub authority_seed: &'a [u8], pub authority_owner: WirePubkey }
@@ -629,7 +644,7 @@ mod wire_sbf {
                 SI::AuthorizeCheckedWithSeed(args)
             }
             12 => {
-                let args = LockupCheckedArgs { unix_timestamp: r.opt_i64()?, epoch: r.opt_u64()?, custodian: r.opt_pubkey()? };
+                let args = LockupCheckedArgs { unix_timestamp: r.opt_i64()?, epoch: r.opt_u64()? };
                 SI::SetLockupChecked(args)
             }
             13 => { SI::GetMinimumDelegation }
@@ -648,7 +663,7 @@ mod wire_sbf {
             _ => {
                 #[cfg(feature = "cu-trace")]
                 pinocchio::msg!("sbf:var:tolerant_fallback");
-                let args = LockupCheckedArgs { unix_timestamp: r.opt_i64()?, epoch: r.opt_u64()?, custodian: r.opt_pubkey()? };
+                let args = LockupCheckedArgs { unix_timestamp: r.opt_i64()?, epoch: r.opt_u64()? };
                 SI::SetLockupChecked(args)
             },
         };
@@ -699,7 +714,12 @@ mod wire_sbf {
                 if seed_len > 0 { seed_buf[..seed_len].copy_from_slice(&args.authority_seed[..seed_len]); }
                 let seed_slice = &seed_buf[..seed_len];
                 let data = crate::state::accounts::AuthorizeWithSeedData { new_authorized, stake_authorize, authority_seed: seed_slice, authority_owner };
-                crate::instruction::process_authorized_with_seeds::process_authorized_with_seeds(accounts, data)
+                // Require at least one signer (base must sign)
+                if !accounts.iter().any(|ai| ai.is_signer()) { return Err(ProgramError::MissingRequiredSignature); }
+                pinocchio::msg!("sbf:aws:precall");
+                let r = crate::instruction::process_authorized_with_seeds::process_authorized_with_seeds(accounts, data);
+                if r.is_err() { pinocchio::msg!("sbf:aws:ret_err"); }
+                r
             }
             SI::InitializeChecked => { pinocchio::msg!("sbf:var:init_checked"); trace!("Instruction: InitializeChecked"); crate::instruction::initialize_checked::process_initialize_checked(accounts) }
             SI::AuthorizeChecked(which) => { pinocchio::msg!("sbf:var:auth_checked"); trace!("Instruction: AuthorizeChecked");
@@ -710,8 +730,8 @@ mod wire_sbf {
                 pinocchio::msg!("sbf:acws:dispatch");
                 let stake_authorize = match args.stake_authorize { StakeAuthorize::Staker => crate::state::StakeAuthorize::Staker, StakeAuthorize::Withdrawer => crate::state::StakeAuthorize::Withdrawer };
                 let authority_owner = Pubkey::from(args.authority_owner);
-                // In native wire, new_authorized is provided as an account; expected at index 3
-                let new_authorized = accounts.get(3).map(|ai| *ai.key()).ok_or(ProgramError::NotEnoughAccountKeys)?;
+                // In native wire, new_authorized is provided as an account at index 1
+                let new_authorized = accounts.get(1).map(|ai| *ai.key()).ok_or(ProgramError::NotEnoughAccountKeys)?;
                 let mut seed_buf = [0u8; 32];
                 let seed_len = core::cmp::min(args.authority_seed.len(), 32);
                 if seed_len > 0 { seed_buf[..seed_len].copy_from_slice(&args.authority_seed[..seed_len]); }
@@ -723,33 +743,10 @@ mod wire_sbf {
                 pinocchio::msg!("sbf:var:set_lockup_checked");
                 trace!("Instruction: SetLockupChecked");
                 pinocchio::msg!("sbf:slc:dispatch");
-                // Minimal breadcrumbs without formatting (SBF-safe)
-                if args.custodian.is_some() { pinocchio::msg!("sbf:slc:arg_cust=1"); } else { pinocchio::msg!("sbf:slc:arg_cust=0"); }
                 // Minimal signer check: any signer in metas (SDK ensures withdrawer/custodian signer)
                 let has_any_signer = accounts.iter().any(|ai| ai.is_signer());
                 if has_any_signer { pinocchio::msg!("sbf:slc:any_signer=1"); } else { pinocchio::msg!("sbf:slc:any_signer=0"); }
                 if !has_any_signer { return Err(ProgramError::MissingRequiredSignature); }
-                // If args provide custodian, require signer only when lockup is in force
-                if let Some(c) = args.custodian {
-                    let want = Pubkey::from(c);
-                    let ok = accounts.iter().any(|ai| ai.key() == &want && ai.is_signer());
-                    if ok { pinocchio::msg!("sbf:slc:cust_sig=1"); } else { pinocchio::msg!("sbf:slc:cust_sig=0"); }
-                    if !ok {
-                        // Determine if lockup is in force; only then require custodian signer
-                        let stake_ai = accounts.get(0).ok_or(ProgramError::NotEnoughAccountKeys)?;
-                        if let Ok(state) = crate::helpers::get_stake_state(stake_ai) {
-                            if let crate::state::stake_state_v2::StakeStateV2::Initialized(meta)
-                                | crate::state::stake_state_v2::StakeStateV2::Stake(meta, _, _) = state
-                            {
-                                let clk = pinocchio::sysvars::clock::Clock::get()?;
-                                if meta.lockup.is_in_force(&clk, None) {
-                                    pinocchio::msg!("sbf:slc:in_force_no_cust_sig");
-                                    return Err(ProgramError::MissingRequiredSignature);
-                                }
-                            }
-                        }
-                    }
-                }
                 let mut buf = [0u8; 1 + 8 + 8];
                 let mut off = 1usize;
                 let mut flags = 0u8;
@@ -773,7 +770,19 @@ mod wire_sbf {
 }
 
 // ---- EpochRewards gating (attempt best-effort sysvar read) ----
-fn epoch_rewards_active() -> bool { false }
+#[inline(always)]
+fn epoch_rewards_active() -> bool {
+    // Best-effort probe of the EpochRewards sysvar. If unavailable, fail open (inactive).
+    // Sysvar address per Agave docs: SysvarEpochRewards1111111111111111111111111
+    mod epoch_rewards_sysvar_id { use pinocchio_pubkey::declare_id; declare_id!("SysvarEpochRewards1111111111111111111111111"); }
+    // The `active` boolean is located after these fields (repr(C), align(16)):
+    // u64 (8) + u64 (8) + Hash (32) + u128 (16) + u64 (8) + u64 (8) = 80 bytes
+    let mut active_byte = [0u8; 1];
+    if crate::helpers::get_sysvar(&mut active_byte, &epoch_rewards_sysvar_id::ID, 80, 1).is_ok() {
+        return active_byte[0] != 0;
+    }
+    false
+}
 
 // ----- Debug opcode loggers -----
 #[cfg(all(feature = "wire_bincode", feature = "std"))]

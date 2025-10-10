@@ -1,14 +1,4 @@
-use crate::state::delegation::Delegation;
-
-#[derive(Debug, Clone, PartialEq)]
-#[repr(C)]
-pub struct Stake {
-    /// Delegation information
-    pub delegation: Delegation,
-    /// Credits observed during the epoch
-    pub credits_observed: u64,
-}
-
-// impl Stake {
-
-// }
+//! Deprecated: Use `crate::state::delegation::Stake` for on-account layout.
+#![allow(deprecated)]
+#[deprecated(note = "Use state::delegation::Stake")]
+pub type Stake = crate::state::delegation::Stake;
