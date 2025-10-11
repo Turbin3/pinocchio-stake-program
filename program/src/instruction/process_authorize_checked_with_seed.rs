@@ -33,7 +33,7 @@ fn derive_with_seed_compat(base: &Pubkey, seed: &[u8], owner: &Pubkey) -> Result
 }
 
 /// Authorize (checked, with seed)
-/// Accounts (strict positions):
+/// Accounts (strict positions, native ABI):
 ///   0. [writable] Stake account (owned by stake program)
 ///   1. [signer]   Base (seed base)
 ///   2. []         Clock sysvar
@@ -46,8 +46,8 @@ pub fn process_authorize_checked_with_seed(
     pinocchio::msg!("acws:enter");
     if accounts.len() < 4 { return Err(ProgramError::NotEnoughAccountKeys); }
 
-    // Enforce strict positions (native wire): [stake, new_authority, clock, base, (custodian?)]
-    let [stake_ai, new_ai, clock_ai, base_ai, rest @ ..] = accounts else {
+    // Enforce strict positions (native wire): [stake, base, clock, new_authority, (custodian?)]
+    let [stake_ai, base_ai, clock_ai, new_ai, rest @ ..] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
     };
 
@@ -104,10 +104,24 @@ pub fn process_authorize_checked_with_seed(
 
     let new_authorized = *new_ai.key();
 
-    // Restricted signer set: base (root) (+ optional custodian)
-    let mut signers = [Pubkey::default(); 2];
+    // Restricted signer set:
+    // - Always include base (root)
+    // - If authorizing via derived PDA, include the current role authority
+    // - Include custodian if present as signer
+    let mut signers = [Pubkey::default(); 4];
     let mut n = 0usize;
+    // base must sign
     signers[n] = base_pk; n += 1;
+    // add current role authority if derived matched it
+    match role {
+        StakeAuthorize::Staker => {
+            if derived_old == staker_pk { signers[n] = staker_pk; n += 1; }
+        }
+        StakeAuthorize::Withdrawer => {
+            if derived_old == withdrawer_pk { signers[n] = withdrawer_pk; n += 1; }
+        }
+    }
+    // optional custodian
     if let Some(c) = maybe_custodian { signers[n] = *c.key(); n += 1; }
     let signers = &signers[..n];
 

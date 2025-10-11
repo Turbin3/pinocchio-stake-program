@@ -433,8 +433,8 @@ fn dispatch_wire_instruction(accounts: &[AccountInfo], ix: wire::StakeInstructio
             let stake_authorize = match args.stake_authorize { StakeAuthorize::Staker => StakeAuthorize::Staker, StakeAuthorize::Withdrawer => StakeAuthorize::Withdrawer };
             let authority_owner = Pubkey::from(args.authority_owner);
             let seed_vec = args.authority_seed.into_bytes();
-            // Native-ABI order: [stake, new_authorized, clock, base]
-            let new_authorized = accounts.get(1).map(|ai| *ai.key()).ok_or(ProgramError::NotEnoughAccountKeys)?;
+            // Native-ABI order: [stake, base, clock, new_authorized]
+            let new_authorized = accounts.get(3).map(|ai| *ai.key()).ok_or(ProgramError::NotEnoughAccountKeys)?;
             let data = AuthorizeCheckedWithSeedData { new_authorized, stake_authorize, authority_seed: &seed_vec, authority_owner };
             let res = instruction::process_authorize_checked_with_seed::process_authorize_checked_with_seed(accounts, data);
             core::mem::drop(seed_vec);
@@ -730,8 +730,8 @@ mod wire_sbf {
                 pinocchio::msg!("sbf:acws:dispatch");
                 let stake_authorize = match args.stake_authorize { StakeAuthorize::Staker => crate::state::StakeAuthorize::Staker, StakeAuthorize::Withdrawer => crate::state::StakeAuthorize::Withdrawer };
                 let authority_owner = Pubkey::from(args.authority_owner);
-                // In native wire, new_authorized is provided as an account at index 1
-                let new_authorized = accounts.get(1).map(|ai| *ai.key()).ok_or(ProgramError::NotEnoughAccountKeys)?;
+                // In native wire, new_authorized is provided as an account at index 3
+                let new_authorized = accounts.get(3).map(|ai| *ai.key()).ok_or(ProgramError::NotEnoughAccountKeys)?;
                 let mut seed_buf = [0u8; 32];
                 let seed_len = core::cmp::min(args.authority_seed.len(), 32);
                 if seed_len > 0 { seed_buf[..seed_len].copy_from_slice(&args.authority_seed[..seed_len]); }

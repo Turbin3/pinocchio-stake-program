@@ -117,15 +117,16 @@ async fn authorize_with_seed_staker_success() {
     tx.try_sign(&[&ctx.payer, &stake_acc], ctx.last_blockhash).unwrap();
     ctx.banks_client.process_transaction(tx).await.unwrap();
 
-    // InitializeChecked with base as current staker
+    // InitializeChecked via raw instruction: set staker to derived PDA
     let init_ix = Instruction {
         program_id,
         accounts: vec![
             AccountMeta::new(stake_acc.pubkey(), false),
             AccountMeta::new_readonly(solana_sdk::sysvar::rent::id(), false),
-            AccountMeta::new_readonly(base.pubkey(), false),
+            AccountMeta::new_readonly(derived_staker, false),
             AccountMeta::new_readonly(withdrawer.pubkey(), true),
         ],
+        // Tag for InitializeChecked (program's native short encoding)
         data: vec![9u8],
     };
     let msg = Message::new(&[init_ix], Some(&ctx.payer.pubkey()));
@@ -215,7 +216,7 @@ async fn authorize_with_seed_missing_base_signer_fails() {
 
     // Build authorize_with_seed but do not sign with base
     let new_staker = Keypair::new();
-    let ix = ixn::authorize_with_seed(
+    let ix = ixn::authorize_with_seed_no_base_signer(
         &stake_acc.pubkey(),
         &base.pubkey(),
         seed.to_string(),

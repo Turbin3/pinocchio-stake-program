@@ -43,36 +43,39 @@ pub fn process_authorized_with_seeds(
     if accounts.len() < 2 { pinocchio::msg!("aws:accs_bad"); return Err(ProgramError::NotEnoughAccountKeys); }
     let stake_ai = &accounts[0];
     let rest_all = if accounts.len() > 1 { &accounts[1..] } else { &accounts[0..0] };
-    // Find base = first signer that is not the stake account and not the Clock sysvar
-    let mut base_idx: Option<usize> = None;
-    for (i, ai) in rest_all.iter().enumerate() {
-        if ai.is_signer()
-            && ai.key() != stake_ai.key()
-            && ai.key() != &pinocchio::sysvars::clock::CLOCK_ID
-        {
-            base_idx = Some(i);
-            break;
-        }
-    }
-    let base_ai = match base_idx { Some(i) => { pinocchio::msg!("aws:base_found"); &rest_all[i] } , None => { pinocchio::msg!("aws:no_base"); return Err(ProgramError::MissingRequiredSignature); } };
-    // Remaining accounts after stake and the chosen base
-    let rest = &rest_all[..];
 
-    // Basic safety checks
+    // Basic safety checks on stake account
     if *stake_ai.owner() != crate::ID { pinocchio::msg!("aws:stake_bad_owner"); return Err(ProgramError::InvalidAccountOwner); }
-    // Tolerate missing writable flag; native builders mark it writable but ProgramTest may reorder flags
-    if base_ai.is_signer() { pinocchio::msg!("aws:base_sig1"); } else { pinocchio::msg!("aws:base_sig0"); }
-    if !base_ai.is_signer() { pinocchio::msg!("aws:base_not_signer"); return Err(ProgramError::MissingRequiredSignature); }
-    
 
     let clock = Clock::get()?;
 
-    // Load state to determine required current authority and expected custodian
+    // Load state to determine expected custodian and current authorities
     pinocchio::msg!("aws:before_get_state");
     let state = match get_stake_state(stake_ai) {
         Ok(s) => s,
         Err(e) => { pinocchio::msg!("aws:get_state_err"); return Err(e); }
     };
+
+    // Determine expected custodian (to avoid mis-identifying it as base)
+    let expected_custodian = match &state {
+        StakeStateV2::Initialized(meta) | StakeStateV2::Stake(meta, _, _) => meta.lockup.custodian,
+        _ => Pubkey::default(),
+    };
+
+    // Identify base: the non-stake, non-Clock, non-custodian account from the remaining metas
+    let mut base_idx: Option<usize> = None;
+    for (i, ai) in rest_all.iter().enumerate() {
+        let k = ai.key();
+        if k != stake_ai.key() && k != &pinocchio::sysvars::clock::CLOCK_ID && k != &expected_custodian {
+            base_idx = Some(i);
+            break;
+        }
+    }
+    let base_ai = match base_idx { Some(i) => { pinocchio::msg!("aws:base_found"); &rest_all[i] } , None => { pinocchio::msg!("aws:no_base"); return Err(ProgramError::MissingRequiredSignature); } };
+
+    // Tolerate missing writable flag; enforce signer strictly for base
+    if base_ai.is_signer() { pinocchio::msg!("aws:base_sig1"); } else { pinocchio::msg!("aws:base_sig0"); }
+    if !base_ai.is_signer() { pinocchio::msg!("aws:base_not_signer"); return Err(ProgramError::MissingRequiredSignature); }
 
     // Derive authority from (base, seed, owner)
     // Reject seeds longer than 32 (native behavior)
@@ -88,13 +91,11 @@ pub fn process_authorized_with_seeds(
         StakeStateV2::Initialized(meta) | StakeStateV2::Stake(meta, _, _) => (meta.authorized.staker, meta.authorized.withdrawer),
         _ => { pinocchio::msg!("aws:bad_state"); return Err(ProgramError::InvalidAccountData); }
     };
-    // Allow current authority to be either derived(base, seed, owner) or the base itself
+    // Allowance checks
     let base_pk = *base_ai.key();
     let allowed = match role {
         StakeAuthorize::Staker => {
-            if derived == staker_pk { pinocchio::msg!("aws:allow_der_staker"); true }
-            else if base_pk == staker_pk { pinocchio::msg!("aws:allow_base_staker"); true }
-            else { false }
+            if derived == staker_pk { pinocchio::msg!("aws:allow_der_staker"); true } else { pinocchio::msg!("aws:staker_ne"); false }
         }
         StakeAuthorize::Withdrawer => {
             if derived == withdrawer_pk { pinocchio::msg!("aws:allow_der_withdrawer"); true }
@@ -105,20 +106,27 @@ pub fn process_authorized_with_seeds(
     if !allowed { pinocchio::msg!("aws:not_allowed"); return Err(ProgramError::MissingRequiredSignature); }
 
     // Optional lockup custodian (scan trailing accounts for a matching signer)
-    let expected_custodian = match &state {
-        StakeStateV2::Initialized(meta) | StakeStateV2::Stake(meta, _, _) => meta.lockup.custodian,
-        _ => Pubkey::default(),
-    };
+    let rest = &rest_all[..];
     let maybe_lockup_authority: Option<&AccountInfo> = rest
         .iter()
         .find(|ai| ai.is_signer() && ai.key() == &expected_custodian);
     if maybe_lockup_authority.is_some() { pinocchio::msg!("aws:custodian_present"); } else { pinocchio::msg!("aws:custodian_absent"); }
     
 
-    // Restricted signer set: base (+ optional custodian)
-    let mut signers = [Pubkey::default(); 2];
+    // Restricted signer set: base (+ optional custodian) and, for derived authority, treat the current authority as signed
+    let mut signers = [Pubkey::default(); 4];
     let mut n = 0usize;
+    // Always include the base signer
     signers[n] = *base_ai.key(); n += 1;
+    // If the role is Staker and derived matches current staker, include staker as if signed
+    if matches!(role, StakeAuthorize::Staker) && derived == staker_pk {
+        signers[n] = staker_pk; n += 1;
+    }
+    // If the role is Withdrawer and we authorized via the derived address, include the current withdrawer key
+    if matches!(role, StakeAuthorize::Withdrawer) && derived == withdrawer_pk {
+        signers[n] = withdrawer_pk; n += 1;
+    }
+    // Include custodian if present as signer
     if let Some(ai) = maybe_lockup_authority { signers[n] = *ai.key(); n += 1; }
     let signers = &signers[..n];
 

@@ -73,7 +73,7 @@ pub mod ixn {
             if am.pubkey == *base { am.is_signer = true; }
             if am.pubkey == *new_authorized { am.is_signer = true; }
         }
-        // Canonicalize meta order to [stake, new_authorized, clock, base, (custodian?)]
+        // Canonicalize meta order to native: [stake, base, clock, new_authorized, (custodian?)]
         let mut stake_meta = None;
         let mut base_meta = None;
         let mut clock_meta = None;
@@ -81,17 +81,54 @@ pub mod ixn {
         let mut other: Vec<AccountMeta> = Vec::new();
         for m in ix.accounts.drain(..) {
             if m.pubkey == *stake { stake_meta = Some(m); continue; }
-            if m.pubkey == *new_authorized { new_meta = Some(m); continue; }
             if m.pubkey == solana_sdk::sysvar::clock::id() { clock_meta = Some(m); continue; }
             if m.pubkey == *base { base_meta = Some(m); continue; }
+            if m.pubkey == *new_authorized { new_meta = Some(m); continue; }
             other.push(m);
         }
         let mut ordered = Vec::new();
         if let Some(m) = stake_meta { ordered.push(m); }
+        if let Some(m) = base_meta { ordered.push(m); }
+        if let Some(m) = clock_meta { ordered.push(m); }
         if let Some(m) = new_meta { ordered.push(m); }
+        // append any remaining metas (e.g., optional custodian) preserving their original flags
+        ordered.extend(other.into_iter());
+        ix.accounts = ordered;
+        ix
+    }
+
+    fn build_authorize_with_seed(
+        stake: &Pubkey,
+        base: &Pubkey,
+        seed: String,
+        owner: &Pubkey,
+        new_authorized: &Pubkey,
+        role: StakeAuthorize,
+        _custodian: Option<&Pubkey>,
+        base_signer: bool,
+    ) -> Instruction {
+        let mut ix = sdk_ixn::authorize_with_seed(stake, base, seed, owner, new_authorized, role, _custodian);
+        ix.program_id = Pubkey::new_from_array(pinocchio_stake::ID);
+        // Canonicalize to [stake, clock, base, (others...)]
+        let mut stake_meta = None;
+        let mut clock_meta = None;
+        let mut base_meta = None;
+        let mut other: Vec<AccountMeta> = Vec::new();
+        for mut m in ix.accounts.drain(..) {
+            if m.pubkey == *stake { stake_meta = Some(m); continue; }
+            if m.pubkey == solana_sdk::sysvar::clock::id() { clock_meta = Some(m); continue; }
+            if m.pubkey == *base {
+                // Control base signer flag explicitly for ProgramTest expectations
+                m.is_signer = base_signer;
+                base_meta = Some(m);
+                continue;
+            }
+            other.push(m);
+        }
+        let mut ordered = Vec::new();
+        if let Some(m) = stake_meta { ordered.push(m); }
         if let Some(m) = clock_meta { ordered.push(m); }
         if let Some(m) = base_meta { ordered.push(m); }
-        // append any remaining metas (e.g., optional custodian) preserving their original flags
         ordered.extend(other.into_iter());
         ix.accounts = ordered;
         ix
@@ -107,27 +144,20 @@ pub mod ixn {
         role: StakeAuthorize,
         _custodian: Option<&Pubkey>,
     ) -> Instruction {
-        let mut ix = sdk_ixn::authorize_with_seed(stake, base, seed, owner, new_authorized, role, _custodian);
-        ix.program_id = Pubkey::new_from_array(pinocchio_stake::ID);
-        // Do not force base signer here; let runtime enforce signatures
-        // Canonicalize to [stake, clock, base, (others...)]
-        let mut stake_meta = None;
-        let mut clock_meta = None;
-        let mut base_meta = None;
-        let mut other: Vec<AccountMeta> = Vec::new();
-        for m in ix.accounts.drain(..) {
-            if m.pubkey == *stake { stake_meta = Some(m); continue; }
-            if m.pubkey == solana_sdk::sysvar::clock::id() { clock_meta = Some(m); continue; }
-            if m.pubkey == *base { base_meta = Some(m); continue; }
-            other.push(m);
-        }
-        let mut ordered = Vec::new();
-        if let Some(m) = stake_meta { ordered.push(m); }
-        if let Some(m) = clock_meta { ordered.push(m); }
-        if let Some(m) = base_meta { ordered.push(m); }
-        ordered.extend(other.into_iter());
-        ix.accounts = ordered;
-        ix
+        build_authorize_with_seed(stake, base, seed, owner, new_authorized, role, _custodian, true)
+    }
+
+    // Helper for negative test: explicitly mark base as non-signer
+    pub fn authorize_with_seed_no_base_signer(
+        stake: &Pubkey,
+        base: &Pubkey,
+        seed: String,
+        owner: &Pubkey,
+        new_authorized: &Pubkey,
+        role: StakeAuthorize,
+        _custodian: Option<&Pubkey>,
+    ) -> Instruction {
+        build_authorize_with_seed(stake, base, seed, owner, new_authorized, role, _custodian, false)
     }
 
     pub fn set_lockup_checked(stake: &Pubkey, args: &solana_sdk::stake::instruction::LockupArgs, signer: &Pubkey) -> Instruction {
